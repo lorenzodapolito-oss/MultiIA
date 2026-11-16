@@ -42,7 +42,7 @@ pub fn models_url(base: &str) -> String {
     format!("{}/models", base.trim().trim_end_matches('/'))
 }
 
-pub fn build_body(model: &str, system: &str, msgs: &[Message]) -> String {
+pub fn build_body(model: &str, system: &str, msgs: &[Message], max_tokens: u32) -> String {
     let mut m: Vec<Value> = Vec::new();
     if !system.trim().is_empty() {
         m.push(json!({"role": "system", "content": system}));
@@ -51,13 +51,18 @@ pub fn build_body(model: &str, system: &str, msgs: &[Message]) -> String {
         msgs.iter()
             .map(|x| json!({"role": x.role, "content": x.content})),
     );
-    json!({
+    let mut body = json!({
         "model": model,
         "messages": m,
         "stream": true,
         "stream_options": {"include_usage": true},
-    })
-    .to_string()
+    });
+    // Senza un limite alcuni servizi (OpenRouter) riservano il massimo possibile e rifiutano
+    // la richiesta se il credito non basta.
+    if max_tokens > 0 {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    body.to_string()
 }
 
 /// Eventi contenuti in una riga `data: …` della risposta.
@@ -161,6 +166,7 @@ pub fn stream_chat(
     system: &str,
     msgs: &[Message],
     timeout: u64,
+    max_tokens: u32,
     cancel: &AtomicBool,
     emit: &mut dyn FnMut(Event),
 ) {
@@ -170,7 +176,7 @@ pub fn stream_chat(
     if !p.api_key.trim().is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
     }
-    let resp = match req.send_string(&build_body(&p.model, system, msgs)) {
+    let resp = match req.send_string(&build_body(&p.model, system, msgs, max_tokens)) {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
@@ -273,12 +279,15 @@ mod tests {
     #[test]
     fn body_has_system_prompt_only_when_present() {
         let m = [Message::new("user", "ciao")];
-        let b: Value = serde_json::from_str(&build_body("m", "", &m)).unwrap();
+        let b: Value = serde_json::from_str(&build_body("m", "", &m, 0)).unwrap();
         assert_eq!(b["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(b["stream"], true);
-        let b: Value = serde_json::from_str(&build_body("m", "sii breve", &m)).unwrap();
+        let b: Value = serde_json::from_str(&build_body("m", "sii breve", &m, 500)).unwrap();
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["content"], "ciao");
+        assert_eq!(b["max_tokens"], 500);
+        let none: Value = serde_json::from_str(&build_body("m", "", &m, 0)).unwrap();
+        assert!(none.get("max_tokens").is_none());
     }
 
     #[test]

@@ -72,6 +72,8 @@ pub struct Settings {
     pub system_prompt: String,
     /// Secondi di attesa massima senza ricevere nulla da una IA.
     pub timeout_secs: u64,
+    /// Lunghezza massima di ogni risposta in token (0 = nessun limite).
+    pub max_tokens: u32,
 }
 
 impl Default for Settings {
@@ -99,6 +101,7 @@ impl Default for Settings {
             ],
             system_prompt: String::new(),
             timeout_secs: 120,
+            max_tokens: 4000,
         }
     }
 }
@@ -165,6 +168,7 @@ impl Settings {
         }
         self.system_prompt = self.system_prompt.chars().take(4000).collect();
         self.timeout_secs = self.timeout_secs.clamp(10, 1800);
+        self.max_tokens = self.max_tokens.min(200_000);
         self
     }
 }
@@ -225,6 +229,16 @@ mod tests {
         assert_eq!(s.providers[0].name, "IA");
         assert_ne!(s.providers[0].id, s.providers[1].id);
         assert_eq!(s.timeout_secs, 10);
+        assert_eq!(
+            Settings {
+                max_tokens: u32::MAX,
+                ..Settings::default()
+            }
+            .sanitized()
+            .max_tokens,
+            200_000
+        );
+        assert_eq!(Settings::default().max_tokens, 4000);
         assert_eq!(s.system_prompt.chars().count(), 4000);
         let many = Settings {
             providers: (0..50).map(|_| Provider::default()).collect(),

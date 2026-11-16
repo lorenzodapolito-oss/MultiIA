@@ -129,10 +129,11 @@ impl App {
             let msgs = panel.begin(&q);
             let run = panel.run;
             started += 1;
-            let (p, system, timeout) = (
+            let (p, system, timeout, max) = (
                 p.clone(),
                 self.settings.system_prompt.clone(),
                 self.settings.timeout_secs,
+                self.settings.max_tokens,
             );
             let (tx, cancel, ctx) = (self.tx.clone(), self.cancel.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -145,7 +146,9 @@ impl App {
                     ctx.request_repaint();
                 };
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    api::stream_chat(&p, &system, &msgs, timeout, &cancel, &mut |ev| send(ev));
+                    api::stream_chat(&p, &system, &msgs, timeout, max, &cancel, &mut |ev| {
+                        send(ev)
+                    });
                 }));
                 if r.is_err() {
                     send(Event::Error("Errore imprevisto nella richiesta".into()));
@@ -462,6 +465,7 @@ impl App {
             ui.label("Istruzioni per tutte le IA (facoltative)");
             ui.add(egui::TextEdit::multiline(&mut self.settings.system_prompt).desired_rows(2).desired_width(f32::INFINITY));
             ui.add(egui::Slider::new(&mut self.settings.timeout_secs, 10..=600).text("Attesa massima (s)"));
+            ui.add(egui::Slider::new(&mut self.settings.max_tokens, 0..=32000).text("Lunghezza massima risposta (token, 0 = nessun limite)"));
         });
         if let Some(i) = delete {
             if i < self.settings.providers.len() && !self.any_running() {

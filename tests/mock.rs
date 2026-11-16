@@ -27,6 +27,7 @@ fn run(url: String) -> Vec<Event> {
         "",
         &[Message::new("user", "ciao")],
         10,
+        1000,
         &AtomicBool::new(false),
         &mut |e| out.push(e),
     );
