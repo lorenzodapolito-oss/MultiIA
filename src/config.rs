@@ -4,6 +4,32 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const MAX_PROVIDERS: usize = 12;
+/// Versione dell'elenco predefinito: se il file è più vecchio, si toglie ciò che è a pagamento.
+const VERSION: u32 = 2;
+
+fn zero() -> u32 {
+    0
+}
+
+/// Servizi a pagamento tolti dall'elenco dalla versione 2.
+const PAID_HOSTS: [&str; 6] = [
+    "api.openai.com",
+    "api.anthropic.com",
+    "api.deepseek.com",
+    "api.x.ai",
+    "api.z.ai",
+    "openrouter.ai",
+];
+
+fn host(url: &str) -> String {
+    url.split("://")
+        .last()
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -68,6 +94,8 @@ impl Provider {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(default = "zero")]
+    pub version: u32,
     pub providers: Vec<Provider>,
     pub system_prompt: String,
     /// Secondi di attesa massima senza ricevere nulla da una IA.
@@ -83,26 +111,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            providers: vec![
-                Provider::new(
-                    "ChatGPT (OpenAI)",
-                    "https://api.openai.com/v1",
-                    "gpt-6.1-sol",
-                ),
-                Provider::new(
-                    "Claude (Anthropic)",
-                    "https://api.anthropic.com/v1",
-                    "claude-sonnet-5-5",
-                ),
-                Provider::new(
-                    "Gemini (Google)",
-                    "https://generativelanguage.googleapis.com/v1beta/openai",
-                    "gemini-2.5-pro",
-                ),
-                Provider::new("DeepSeek", "https://api.deepseek.com", "deepseek-flash"),
-                Provider::new("Grok (xAI)", "https://api.x.ai/v1", "grok-4.7"),
-                Provider::new("GLM (Z.ai)", "https://api.z.ai/api/paas/v4", "glm-5.3"),
-            ],
+            version: VERSION,
+            providers: free_providers(),
             system_prompt: String::new(),
             timeout_secs: 120,
             max_tokens: 4000,
@@ -114,32 +124,50 @@ impl Default for Settings {
 
 /// Modelli già pronti da aggiungere con un clic.
 pub fn presets() -> Vec<Provider> {
+    let mut v = free_providers();
+    v.push(Provider::new(
+        "Ollama (sul tuo PC)",
+        "http://localhost:11434/v1",
+        "",
+    ));
+    v.push(Provider::new(
+        "LM Studio (sul tuo PC)",
+        "http://localhost:1234/v1",
+        "",
+    ));
+    v
+}
+
+/// Servizi con un piano gratuito per l'API (limiti e nomi dei modelli possono cambiare:
+/// «Cerca modelli» in Impostazioni mostra quelli disponibili).
+pub fn free_providers() -> Vec<Provider> {
     vec![
-        Provider::new(
-            "ChatGPT (OpenAI)",
-            "https://api.openai.com/v1",
-            "gpt-6.1-sol",
-        ),
-        Provider::new(
-            "Claude (Anthropic)",
-            "https://api.anthropic.com/v1",
-            "claude-sonnet-5-5",
-        ),
         Provider::new(
             "Gemini (Google)",
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-2.5-pro",
+            "gemini-2.5-flash",
         ),
+        Provider::new(
+            "Groq",
+            "https://api.groq.com/openai/v1",
+            "llama-3.3-70b-versatile",
+        ),
+        Provider::new("Cerebras", "https://api.cerebras.ai/v1", "llama-3.3-70b"),
         Provider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
-            "mistral-large-latest",
+            "mistral-small-latest",
         ),
-        Provider::new("Ollama (sul tuo PC)", "http://localhost:11434/v1", ""),
-        Provider::new("LM Studio (sul tuo PC)", "http://localhost:1234/v1", ""),
-        Provider::new("DeepSeek", "https://api.deepseek.com", "deepseek-flash"),
-        Provider::new("Grok (xAI)", "https://api.x.ai/v1", "grok-4.7"),
-        Provider::new("GLM (Z.ai)", "https://api.z.ai/api/paas/v4", "glm-5.3"),
+        Provider::new(
+            "NVIDIA",
+            "https://integrate.api.nvidia.com/v1",
+            "meta/llama-3.3-70b-instruct",
+        ),
+        Provider::new(
+            "GitHub Models",
+            "https://models.github.ai/inference",
+            "openai/gpt-4.1-mini",
+        ),
     ]
 }
 
@@ -154,6 +182,27 @@ pub fn new_id() -> String {
 }
 
 impl Settings {
+    /// Porta un file vecchio all'elenco attuale: toglie i servizi a pagamento (tenendo
+    /// le chiavi dei servizi che restano) e aggiunge quelli gratuiti che mancano.
+    pub fn migrated(mut self) -> Self {
+        if self.version >= VERSION {
+            return self;
+        }
+        self.providers
+            .retain(|p| !PAID_HOSTS.iter().any(|h| host(&p.base_url).contains(h)));
+        for d in free_providers() {
+            if !self
+                .providers
+                .iter()
+                .any(|p| host(&p.base_url) == host(&d.base_url))
+            {
+                self.providers.push(d);
+            }
+        }
+        self.version = VERSION;
+        self
+    }
+
     /// Rimette in ordine ciò che arriva da un file modificato a mano.
     pub fn sanitized(mut self) -> Self {
         self.providers.truncate(MAX_PROVIDERS);
@@ -194,6 +243,7 @@ pub fn load(path: &std::path::Path) -> Settings {
         .ok()
         .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
         .unwrap_or_default()
+        .migrated()
         .sanitized()
 }
 
@@ -281,6 +331,64 @@ mod tests {
         assert_eq!(load(&f).providers.len(), 6);
         assert_eq!(load(&d.join("manca.json")).providers.len(), 6);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn old_files_lose_paid_services_but_keep_keys_of_the_rest() {
+        let mut old = Settings {
+            version: 0,
+            providers: vec![
+                Provider::new("ChatGPT", "https://api.openai.com/v1", "gpt"),
+                Provider::new("Grok", "https://api.x.ai/v1", "g"),
+                Provider::new(
+                    "Gemini",
+                    "https://generativelanguage.googleapis.com/v1beta/openai",
+                    "gemini-x",
+                ),
+                Provider::new("Mia", "https://example.org/v1", "m"),
+            ],
+            ..Settings::default()
+        };
+        old.providers[2].api_key = "chiave-gemini".into();
+        let s = old.migrated();
+        assert_eq!(s.version, VERSION);
+        let names: Vec<_> = s.providers.iter().map(|p| p.name.as_str()).collect();
+        assert!(!names.contains(&"ChatGPT") && !names.contains(&"Grok"));
+        assert!(names.contains(&"Mia") && names.contains(&"Groq") && names.contains(&"Cerebras"));
+        assert_eq!(
+            s.providers
+                .iter()
+                .find(|p| p.name == "Gemini")
+                .map(|p| p.api_key.as_str()),
+            Some("chiave-gemini")
+        );
+        assert_eq!(
+            s.providers
+                .iter()
+                .filter(|p| p.base_url.contains("generativelanguage"))
+                .count(),
+            1
+        );
+        // Un file già aggiornato non cambia.
+        assert_eq!(s.clone().migrated(), s);
+    }
+
+    #[test]
+    fn a_file_without_version_counts_as_old() {
+        let s: Settings = serde_json::from_str(r#"{"providers":[]}"#).unwrap();
+        assert_eq!(s.version, 0);
+        assert!(!s.migrated().providers.is_empty());
+    }
+
+    #[test]
+    fn no_default_or_preset_is_a_paid_service() {
+        for p in free_providers().iter().chain(presets().iter()) {
+            assert!(
+                !PAID_HOSTS.iter().any(|h| host(&p.base_url).contains(h)),
+                "{}",
+                p.name
+            );
+        }
     }
 
     #[test]
