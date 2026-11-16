@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Idle,
+    /// In attesa del suo turno (si parte pochi modelli alla volta).
+    Queued,
     Running,
     Done,
     Failed(String),
@@ -40,8 +42,9 @@ impl Panel {
         }
     }
 
+    /// In coda o in corso: il pannello è occupato.
     pub fn is_running(&self) -> bool {
-        self.status == Status::Running
+        matches!(self.status, Status::Queued | Status::Running)
     }
 
     /// Comincia un nuovo invio e restituisce la conversazione da mandare.
@@ -55,6 +58,14 @@ impl Panel {
         self.started = Some(Instant::now());
         self.elapsed = Duration::ZERO;
         self.history.clone()
+    }
+
+    /// Come `begin`, ma il pannello aspetta il suo turno finché non arriva `Event::Started`.
+    pub fn queue(&mut self, question: &str) -> Vec<Message> {
+        let msgs = self.begin(question);
+        self.status = Status::Queued;
+        self.started = None;
+        msgs
     }
 
     /// Segna l'invio come non partito (per esempio manca la chiave).
@@ -82,10 +93,18 @@ impl Panel {
     }
 
     pub fn apply(&mut self, ev: Event) {
-        if !self.is_running() {
+        if self.status == Status::Queued {
+            if ev == Event::Started {
+                self.status = Status::Running;
+                self.started = Some(Instant::now());
+            }
+            return;
+        }
+        if self.status != Status::Running {
             return;
         }
         match ev {
+            Event::Started => {}
             Event::Text(t) => self.text.push_str(&t),
             Event::Reasoning(t) => self.reasoning.push_str(&t),
             Event::Usage { prompt, completion } => self.usage = Some((prompt, completion)),
@@ -203,6 +222,26 @@ mod tests {
         p.apply(Event::Done);
         assert_eq!(p.status, Status::Failed("Risposta vuota".into()));
         assert!(p.history.is_empty());
+    }
+
+    #[test]
+    fn queued_panels_wait_for_started_and_can_be_cancelled() {
+        let mut p = Panel::new("a");
+        assert_eq!(p.queue("q").len(), 1);
+        assert_eq!(p.status, Status::Queued);
+        assert!(p.is_running());
+        p.apply(Event::Text("troppo presto".into()));
+        assert!(p.text.is_empty());
+        p.apply(Event::Started);
+        assert_eq!(p.status, Status::Running);
+        p.apply(Event::Text("ok".into()));
+        p.apply(Event::Done);
+        assert_eq!(p.status, Status::Done);
+        let mut q = Panel::new("b");
+        q.queue("q");
+        q.cancel();
+        assert_eq!(q.status, Status::Failed("Annullato".into()));
+        assert!(q.history.is_empty());
     }
 
     #[test]

@@ -74,6 +74,10 @@ pub struct Settings {
     pub timeout_secs: u64,
     /// Lunghezza massima di ogni risposta in token (0 = nessun limite).
     pub max_tokens: u32,
+    /// Chiave della pagina OpenRouter.
+    pub openrouter_key: String,
+    /// Modelli gratuiti di OpenRouter che l'utente ha spento.
+    pub or_disabled: Vec<String>,
 }
 
 impl Default for Settings {
@@ -102,6 +106,8 @@ impl Default for Settings {
             system_prompt: String::new(),
             timeout_secs: 120,
             max_tokens: 4000,
+            openrouter_key: String::new(),
+            or_disabled: Vec::new(),
         }
     }
 }
@@ -129,7 +135,6 @@ pub fn presets() -> Vec<Provider> {
             "https://api.mistral.ai/v1",
             "mistral-large-latest",
         ),
-        Provider::new("OpenRouter", "https://openrouter.ai/api/v1", ""),
         Provider::new("Ollama (sul tuo PC)", "http://localhost:11434/v1", ""),
         Provider::new("LM Studio (sul tuo PC)", "http://localhost:1234/v1", ""),
         Provider::new("DeepSeek", "https://api.deepseek.com", "deepseek-flash"),
@@ -169,6 +174,8 @@ impl Settings {
         self.system_prompt = self.system_prompt.chars().take(4000).collect();
         self.timeout_secs = self.timeout_secs.clamp(10, 1800);
         self.max_tokens = self.max_tokens.min(200_000);
+        self.openrouter_key = self.openrouter_key.trim().to_string();
+        self.or_disabled.truncate(2000);
         self
     }
 }

@@ -23,6 +23,8 @@ impl Message {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// Il turno di questa IA è arrivato e la richiesta parte.
+    Started,
     Text(String),
     /// Il "ragionamento" dei modelli che lo mostrano (DeepSeek, GLM).
     Reasoning(String),
@@ -176,6 +178,9 @@ pub fn stream_chat(
     if !p.api_key.trim().is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
     }
+    if p.base_url.contains("openrouter.ai") {
+        req = req.set("X-Title", "MultiIA");
+    }
     let resp = match req.send_string(&build_body(&p.model, system, msgs, max_tokens)) {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
@@ -219,7 +224,7 @@ pub fn stream_chat(
                     emit(ev);
                     return;
                 }
-                Event::Usage { .. } => {}
+                Event::Usage { .. } | Event::Started => {}
             }
             emit(ev);
         }
@@ -238,6 +243,61 @@ pub fn list_models(p: &Provider, timeout: u64) -> Result<Vec<String>, String> {
             let body = r.into_string().map_err(|e| e.to_string())?;
             Ok(parse_models(&body))
         }
+        Err(ureq::Error::Status(c, r)) => Err(http_error(c, &r.into_string().unwrap_or_default())),
+        Err(e) => Err(transport_error(&e)),
+    }
+}
+
+pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Modelli gratuiti di OpenRouter che rispondono con testo (niente `:batch`, niente a pagamento).
+pub fn parse_free_models(body: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let zero = |m: &Value, k: &str| {
+        m.pointer(&format!("/pricing/{k}"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            == Some(0.0)
+    };
+    let mut ids: Vec<String> = v
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|m| {
+                    let id = m.get("id").and_then(Value::as_str).unwrap_or("");
+                    let free =
+                        id.ends_with(":free") || (zero(m, "prompt") && zero(m, "completion"));
+                    let text_out = m
+                        .pointer("/architecture/output_modalities")
+                        .and_then(Value::as_array)
+                        .is_none_or(|o| o.iter().any(|x| x.as_str() == Some("text")));
+                    !id.is_empty()
+                        && !id.ends_with(":batch")
+                        && !id.starts_with("openrouter/")
+                        && free
+                        && text_out
+                })
+                .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Elenco dei modelli gratuiti di OpenRouter (non serve la chiave).
+pub fn list_free_models(timeout: u64) -> Result<Vec<String>, String> {
+    match agent(timeout.min(30))
+        .get(&models_url(OPENROUTER_URL))
+        .call()
+    {
+        Ok(r) => Ok(parse_free_models(
+            &r.into_string().map_err(|e| e.to_string())?,
+        )),
         Err(ureq::Error::Status(c, r)) => Err(http_error(c, &r.into_string().unwrap_or_default())),
         Err(e) => Err(transport_error(&e)),
     }
@@ -325,6 +385,24 @@ mod tests {
         assert!(http_error(429, "slow down").contains("slow down"));
         assert!(http_error(503, "").contains("servizio"));
         assert!(http_error(418, "").contains("418"));
+    }
+
+    #[test]
+    fn only_free_text_models_are_kept() {
+        let b = r#"{"data":[
+          {"id":"a/free:free","pricing":{"prompt":"0","completion":"0"}},
+          {"id":"b/zero","pricing":{"prompt":"0","completion":"0"}},
+          {"id":"c/paid","pricing":{"prompt":"0.000001","completion":"0.000002"}},
+          {"id":"d/batch:batch","pricing":{"prompt":"0","completion":"0"}},
+          {"id":"e/img:free","architecture":{"output_modalities":["image"]}},
+          {"id":"openrouter/auto","pricing":{"prompt":"0","completion":"0"}},
+          {"id":"f/mix:free","architecture":{"output_modalities":["text","image"]}},
+          {"x":1}]}"#;
+        assert_eq!(
+            parse_free_models(b),
+            vec!["a/free:free", "b/zero", "f/mix:free"]
+        );
+        assert!(parse_free_models("rotto").is_empty());
     }
 
     #[test]

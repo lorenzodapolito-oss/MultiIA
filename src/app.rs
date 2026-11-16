@@ -1,18 +1,22 @@
-//! Interfaccia: una domanda, una colonna per ogni IA, risposte in streaming.
+//! Interfaccia: due pagine. «Tutte le IA» (una colonna per ogni servizio) e «OpenRouter»
+//! (una chat per ogni modello gratuito).
 
-use crate::api::{self, Event};
+use crate::api::{self, Event, Message};
 use crate::config::{self, Provider, Settings};
 use crate::session::{duration_text, export_markdown, Panel, Status};
 use crate::theme;
 use eframe::egui::{self, Color32, RichText};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const APP_TITLE: &str = "MultiIA";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Quante richieste OpenRouter partono insieme: i modelli gratuiti hanno limiti al minuto.
+const OR_WORKERS: usize = 4;
+const OR_COLUMN_WIDTH: f32 = 340.0;
 
 const COLORS: [Color32; 6] = [
     theme::BTN_BLUE,
@@ -33,12 +37,30 @@ enum Msg {
         id: String,
         res: Result<Vec<String>, String>,
     },
+    FreeModels(Result<Vec<String>, String>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    All,
+    OpenRouter,
+}
+
+struct Job {
+    p: Provider,
+    msgs: Vec<Message>,
+    run: u64,
 }
 
 pub struct App {
     settings: Settings,
     path: PathBuf,
+    page: Page,
     panels: Vec<Panel>,
+    or_models: Vec<String>,
+    or_panels: Vec<Panel>,
+    or_note: String,
+    or_loading: bool,
     prompt: String,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -53,6 +75,92 @@ fn color_button(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response
     ui.add(egui::Button::new(RichText::new(text).color(theme::ON_COLOR).strong()).fill(color))
 }
 
+/// Provider "virtuale" per un modello gratuito di OpenRouter.
+pub fn or_provider(model: &str, key: &str) -> Provider {
+    Provider {
+        id: model.to_string(),
+        name: model.to_string(),
+        base_url: api::OPENROUTER_URL.to_string(),
+        model: model.to_string(),
+        api_key: key.to_string(),
+        enabled: true,
+    }
+}
+
+/// Una colonna: intestazione colorata, stato, conversazione. Restituisce la risposta da copiare.
+fn column_ui(
+    ui: &mut egui::Ui,
+    name: &str,
+    model: &str,
+    color: Color32,
+    panel: &Panel,
+    id: &str,
+) -> Option<String> {
+    let mut copy = None;
+    egui::Frame::new()
+        .fill(color)
+        .corner_radius(10)
+        .inner_margin(8)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(name)
+                        .strong()
+                        .size(15.0)
+                        .color(theme::ON_COLOR),
+                );
+                if !model.is_empty() {
+                    ui.label(RichText::new(model).color(theme::ON_COLOR));
+                }
+            });
+            let mut st = match &panel.status {
+                Status::Idle => String::new(),
+                Status::Queued => "in coda".into(),
+                Status::Running => format!("in corso · {}", duration_text(panel.elapsed())),
+                Status::Done => format!("fatto in {}", duration_text(panel.elapsed())),
+                Status::Failed(_) => "errore".into(),
+            };
+            if let Some((a, b)) = panel.usage {
+                st.push_str(&format!(" · {a}+{b} token"));
+            }
+            ui.label(RichText::new(st).color(theme::ON_COLOR));
+        });
+    if let Some(t) = panel.history.iter().rev().find(|m| m.role == "assistant") {
+        if ui.small_button("Copia ultima risposta").clicked() {
+            copy = Some(t.content.clone());
+        }
+    }
+    egui::ScrollArea::vertical()
+        .id_salt(("col", id))
+        .stick_to_bottom(panel.is_running())
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for m in &panel.history {
+                if m.role == "user" {
+                    ui.label(RichText::new(&m.content).italics().color(theme::MUTED));
+                } else {
+                    ui.add(egui::Label::new(&m.content).selectable(true));
+                }
+                ui.add_space(6.0);
+            }
+            if !panel.reasoning.is_empty() {
+                egui::CollapsingHeader::new("Ragionamento")
+                    .id_salt(("r", id))
+                    .default_open(panel.status == Status::Running)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&panel.reasoning).color(theme::MUTED));
+                    });
+            }
+            if panel.status == Status::Running && !panel.text.is_empty() {
+                ui.add(egui::Label::new(&panel.text).selectable(true));
+            }
+            if let Status::Failed(e) = &panel.status {
+                ui.colored_label(theme::ERR, e);
+            }
+        });
+    copy
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -61,7 +169,12 @@ impl App {
         let mut app = Self {
             settings: config::load(&path),
             path,
+            page: Page::All,
             panels: Vec::new(),
+            or_models: Vec::new(),
+            or_panels: Vec::new(),
+            or_note: String::new(),
+            or_loading: false,
             prompt: String::new(),
             tx,
             rx,
@@ -99,8 +212,33 @@ impl App {
             .collect();
     }
 
+    fn sync_or_panels(&mut self) {
+        let old = std::mem::take(&mut self.or_panels);
+        self.or_panels = self
+            .or_models
+            .iter()
+            .map(|m| {
+                old.iter()
+                    .find(|o| &o.provider_id == m)
+                    .cloned()
+                    .unwrap_or_else(|| Panel::new(m))
+            })
+            .collect();
+    }
+
+    fn or_enabled(&self, model: &str) -> bool {
+        !self.settings.or_disabled.iter().any(|d| d == model)
+    }
+
+    fn page_panels(&self) -> &[Panel] {
+        match self.page {
+            Page::All => &self.panels,
+            Page::OpenRouter => &self.or_panels,
+        }
+    }
+
     fn any_running(&self) -> bool {
-        self.panels.iter().any(Panel::is_running)
+        self.page_panels().iter().any(Panel::is_running)
     }
 
     fn save_settings(&mut self) {
@@ -111,32 +249,35 @@ impl App {
         }
     }
 
-    fn send(&mut self, ctx: &egui::Context) {
-        let q = self.prompt.trim().to_string();
-        if q.is_empty() || self.any_running() {
+    /// Fa partire le richieste con al massimo `workers` thread; chi aspetta resta «in coda».
+    fn run_jobs(&mut self, ctx: &egui::Context, jobs: Vec<Job>, workers: usize) {
+        if jobs.is_empty() {
             return;
         }
-        self.cancel.store(false, Ordering::SeqCst);
-        let mut started = 0;
-        for (p, panel) in self.settings.providers.iter().zip(self.panels.iter_mut()) {
-            if !p.enabled {
-                continue;
-            }
-            if let Err(m) = p.ready() {
-                panel.fail_to_start(m);
-                continue;
-            }
-            let msgs = panel.begin(&q);
-            let run = panel.run;
-            started += 1;
-            let (p, system, timeout, max) = (
-                p.clone(),
+        // Ogni invio ha il suo segnale di annullamento: i vecchi lavori in coda non ripartono.
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let n = workers.clamp(1, jobs.len());
+        let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+        for _ in 0..n {
+            let (queue, tx, cancel, ctx) = (
+                queue.clone(),
+                self.tx.clone(),
+                self.cancel.clone(),
+                ctx.clone(),
+            );
+            let (system, timeout, max) = (
                 self.settings.system_prompt.clone(),
                 self.settings.timeout_secs,
                 self.settings.max_tokens,
             );
-            let (tx, cancel, ctx) = (self.tx.clone(), self.cancel.clone(), ctx.clone());
-            std::thread::spawn(move || {
+            std::thread::spawn(move || loop {
+                let job = queue.lock().ok().and_then(|mut q| q.pop_front());
+                let Some(Job { p, msgs, run }) = job else {
+                    break;
+                };
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
                 let send = |ev: Event| {
                     let _ = tx.send(Msg::Chat {
                         id: p.id.clone(),
@@ -145,6 +286,7 @@ impl App {
                     });
                     ctx.request_repaint();
                 };
+                send(Event::Started);
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     api::stream_chat(&p, &system, &msgs, timeout, max, &cancel, &mut |ev| {
                         send(ev)
@@ -155,21 +297,99 @@ impl App {
                 }
             });
         }
-        self.message = if started == 0 {
+    }
+
+    fn send(&mut self, ctx: &egui::Context) {
+        let q = self.prompt.trim().to_string();
+        if q.is_empty() || self.any_running() {
+            return;
+        }
+        let mut jobs = Vec::new();
+        let workers;
+        match self.page {
+            Page::All => {
+                for (p, panel) in self.settings.providers.iter().zip(self.panels.iter_mut()) {
+                    if !p.enabled {
+                        continue;
+                    }
+                    if let Err(m) = p.ready() {
+                        panel.fail_to_start(m);
+                        continue;
+                    }
+                    let msgs = panel.begin(&q);
+                    jobs.push(Job {
+                        p: p.clone(),
+                        msgs,
+                        run: panel.run,
+                    });
+                }
+                workers = jobs.len();
+            }
+            Page::OpenRouter => {
+                if self.settings.openrouter_key.trim().is_empty() {
+                    self.message = "Inserisci prima la chiave OpenRouter qui sopra.".into();
+                    return;
+                }
+                let key = self.settings.openrouter_key.clone();
+                let off: HashSet<&String> = self.settings.or_disabled.iter().collect();
+                for (m, panel) in self.or_models.iter().zip(self.or_panels.iter_mut()) {
+                    if off.contains(m) {
+                        continue;
+                    }
+                    let msgs = panel.queue(&q);
+                    jobs.push(Job {
+                        p: or_provider(m, &key),
+                        msgs,
+                        run: panel.run,
+                    });
+                }
+                workers = OR_WORKERS;
+            }
+        }
+        self.message = if jobs.is_empty() {
             "Nessuna IA pronta: controlla le impostazioni.".into()
         } else {
+            self.prompt.clear();
             String::new()
         };
-        if started > 0 {
-            self.prompt.clear();
-        }
+        self.run_jobs(ctx, jobs, workers);
     }
 
     fn cancel_all(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
-        for p in &mut self.panels {
+        let panels = match self.page {
+            Page::All => &mut self.panels,
+            Page::OpenRouter => &mut self.or_panels,
+        };
+        for p in panels {
             p.cancel();
         }
+    }
+
+    fn reset_chats(&mut self) {
+        if self.any_running() {
+            return;
+        }
+        let panels = match self.page {
+            Page::All => &mut self.panels,
+            Page::OpenRouter => &mut self.or_panels,
+        };
+        for p in panels {
+            p.reset();
+        }
+    }
+
+    fn fetch_free_models(&mut self, ctx: &egui::Context) {
+        if self.or_loading {
+            return;
+        }
+        self.or_loading = true;
+        self.or_note = "Cerco i modelli gratuiti…".into();
+        let (tx, ctx, t) = (self.tx.clone(), ctx.clone(), self.settings.timeout_secs);
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::FreeModels(api::list_free_models(t)));
+            ctx.request_repaint();
+        });
     }
 
     fn fetch_models(&mut self, ctx: &egui::Context, p: &Provider) {
@@ -195,9 +415,24 @@ impl App {
                     if let Some(p) = self
                         .panels
                         .iter_mut()
+                        .chain(self.or_panels.iter_mut())
                         .find(|p| p.provider_id == id && p.run == run)
                     {
                         p.apply(ev);
+                    }
+                }
+                Msg::FreeModels(res) => {
+                    self.or_loading = false;
+                    match res {
+                        Ok(list) if list.is_empty() => {
+                            self.or_note = "OpenRouter non ha dato nessun modello gratuito.".into();
+                        }
+                        Ok(list) => {
+                            self.or_note = format!("{} modelli gratuiti disponibili", list.len());
+                            self.or_models = list;
+                            self.sync_or_panels();
+                        }
+                        Err(e) => self.or_note = e,
                     }
                 }
                 Msg::Models { id, res } => match res {
@@ -221,14 +456,23 @@ impl App {
     }
 
     fn export(&mut self) {
-        let rows: Vec<(String, String, &Panel)> = self
-            .settings
-            .providers
-            .iter()
-            .zip(&self.panels)
-            .filter(|(p, _)| p.enabled)
-            .map(|(p, panel)| (p.name.clone(), p.model.clone(), panel))
-            .collect();
+        let rows: Vec<(String, String, &Panel)> = match self.page {
+            Page::All => self
+                .settings
+                .providers
+                .iter()
+                .zip(&self.panels)
+                .filter(|(p, _)| p.enabled)
+                .map(|(p, panel)| (p.name.clone(), p.model.clone(), panel))
+                .collect(),
+            Page::OpenRouter => self
+                .or_models
+                .iter()
+                .zip(&self.or_panels)
+                .filter(|(m, _)| self.or_enabled(m))
+                .map(|(m, panel)| (m.clone(), "OpenRouter".to_string(), panel))
+                .collect(),
+        };
         let when = chrono::Local::now().format("%d/%m/%Y %H:%M").to_string();
         let md = export_markdown(&rows, &when);
         let Some(path) = rfd::FileDialog::new()
@@ -245,6 +489,7 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!("{APP_TITLE} di Lorenzo D'Apolito"))
@@ -255,13 +500,33 @@ impl App {
             ui.label(RichText::new(format!("v{APP_VERSION}")).color(theme::MUTED));
         });
         ui.horizontal_wrapped(|ui| {
+            for (page, label, color) in [
+                (Page::All, "Tutte le IA", theme::BTN_BLUE),
+                (
+                    Page::OpenRouter,
+                    "OpenRouter (modelli gratuiti)",
+                    theme::BTN_LILAC,
+                ),
+            ] {
+                let sel = self.page == page;
+                let text = RichText::new(label)
+                    .color(theme::ON_COLOR)
+                    .strong()
+                    .size(if sel { 16.0 } else { 14.0 });
+                let fill = if sel { color } else { theme::PRIMARY_LIGHT };
+                if ui.add(egui::Button::new(text).fill(fill)).clicked() && !sel {
+                    self.page = page;
+                    if page == Page::OpenRouter && self.or_models.is_empty() {
+                        self.fetch_free_models(&ctx);
+                    }
+                }
+            }
+            ui.separator();
             if self.any_running() && color_button(ui, "Annulla", theme::BTN_PINK).clicked() {
                 self.cancel_all();
             }
-            if color_button(ui, "Nuova chat", theme::BTN_MINT).clicked() && !self.any_running() {
-                for p in &mut self.panels {
-                    p.reset();
-                }
+            if color_button(ui, "Nuova chat", theme::BTN_MINT).clicked() {
+                self.reset_chats();
             }
             if color_button(ui, "Esporta risposte", theme::BTN_YELLOW).clicked() {
                 self.export();
@@ -328,74 +593,115 @@ impl App {
                     .get(i % COLORS.len())
                     .copied()
                     .unwrap_or(theme::BTN_BLUE);
-                egui::Frame::new()
-                    .fill(color)
-                    .corner_radius(10)
-                    .inner_margin(8)
-                    .show(col, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(&p.name)
-                                    .strong()
-                                    .size(16.0)
-                                    .color(theme::ON_COLOR),
-                            );
-                            ui.label(RichText::new(&p.model).color(theme::ON_COLOR));
-                        });
-                        let mut st = match &panel.status {
-                            Status::Idle => String::new(),
-                            Status::Running => {
-                                format!("in corso · {}", duration_text(panel.elapsed()))
-                            }
-                            Status::Done => format!("fatto in {}", duration_text(panel.elapsed())),
-                            Status::Failed(_) => "errore".into(),
-                        };
-                        if let Some((a, b)) = panel.usage {
-                            st.push_str(&format!(" · {a}+{b} token"));
-                        }
-                        ui.label(RichText::new(st).color(theme::ON_COLOR));
-                    });
-                let last = panel
-                    .history
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "assistant")
-                    .map(|m| m.content.clone());
-                if let Some(t) = &last {
-                    if col.small_button("Copia ultima risposta").clicked() {
-                        copy = Some(t.clone());
-                    }
+                if let Some(t) = column_ui(col, &p.name, &p.model, color, panel, &p.id) {
+                    copy = Some(t);
                 }
-                egui::ScrollArea::vertical()
-                    .id_salt(("col", &p.id))
-                    .stick_to_bottom(panel.is_running())
-                    .auto_shrink([false, false])
-                    .show(col, |ui| {
-                        for m in &panel.history {
-                            if m.role == "user" {
-                                ui.label(RichText::new(&m.content).italics().color(theme::MUTED));
-                            } else {
-                                ui.add(egui::Label::new(&m.content).selectable(true));
-                            }
-                            ui.add_space(6.0);
-                        }
-                        if !panel.reasoning.is_empty() {
-                            egui::CollapsingHeader::new("Ragionamento")
-                                .id_salt(("r", &p.id))
-                                .default_open(panel.is_running())
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new(&panel.reasoning).color(theme::MUTED));
-                                });
-                        }
-                        if matches!(panel.status, Status::Running) && !panel.text.is_empty() {
-                            ui.add(egui::Label::new(&panel.text).selectable(true));
-                        }
-                        if let Status::Failed(e) = &panel.status {
-                            ui.colored_label(theme::ERR, e);
-                        }
-                    });
             }
         });
+        if let Some(t) = copy {
+            ui.ctx().copy_text(t);
+            self.message = "Risposta copiata.".into();
+        }
+    }
+
+    fn openrouter_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut save = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Chiave OpenRouter");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.settings.openrouter_key)
+                    .password(true)
+                    .desired_width(320.0),
+            );
+            if r.lost_focus() {
+                save = true;
+            }
+            if color_button(ui, "Aggiorna elenco", theme::BTN_MINT).clicked() {
+                self.fetch_free_models(&ctx);
+            }
+            ui.label(RichText::new(&self.or_note).color(theme::MUTED));
+        });
+        ui.label(
+            RichText::new(
+                "Solo modelli gratuiti, una chat per ciascuno. La chiave si crea su openrouter.ai/settings/keys. I gratuiti hanno limiti di richieste: ne partono 4 alla volta; spegni quelli che non ti servono.",
+            )
+            .color(theme::MUTED),
+        );
+        let n_on = self.or_models.iter().filter(|m| self.or_enabled(m)).count();
+        let mut toggled = false;
+        egui::CollapsingHeader::new(format!(
+            "Modelli attivi ({n_on} su {})",
+            self.or_models.len()
+        ))
+        .id_salt("or_toggle")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.small_button("Tutti").clicked() {
+                    self.settings.or_disabled.clear();
+                    toggled = true;
+                }
+                if ui.small_button("Nessuno").clicked() {
+                    self.settings.or_disabled = self.or_models.clone();
+                    toggled = true;
+                }
+            });
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for m in self.or_models.clone() {
+                        let mut on = self.or_enabled(&m);
+                        if ui.checkbox(&mut on, &m).changed() {
+                            self.settings.or_disabled.retain(|d| d != &m);
+                            if !on {
+                                self.settings.or_disabled.push(m);
+                            }
+                            toggled = true;
+                        }
+                    }
+                });
+        });
+        if save || toggled {
+            self.save_settings();
+        }
+        ui.separator();
+        let shown: Vec<usize> = (0..self.or_models.len())
+            .filter(|i| self.or_models.get(*i).is_some_and(|m| self.or_enabled(m)))
+            .collect();
+        if shown.is_empty() {
+            ui.label(
+                "Nessun modello da mostrare: premi «Aggiorna elenco» o attiva qualche modello.",
+            );
+            return;
+        }
+        let mut copy: Option<String> = None;
+        let h = ui.available_height();
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    for (n, i) in shown.iter().enumerate() {
+                        let (Some(m), Some(panel)) =
+                            (self.or_models.get(*i), self.or_panels.get(*i))
+                        else {
+                            continue;
+                        };
+                        let color = COLORS
+                            .get(n % COLORS.len())
+                            .copied()
+                            .unwrap_or(theme::BTN_BLUE);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(OR_COLUMN_WIDTH, h - 14.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                if let Some(t) = column_ui(ui, m, "", color, panel, m) {
+                                    copy = Some(t);
+                                }
+                            },
+                        );
+                    }
+                });
+            });
         if let Some(t) = copy {
             ui.ctx().copy_text(t);
             self.message = "Risposta copiata.".into();
@@ -506,7 +812,10 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
         egui::Panel::bottom("domanda").show(ui, |ui| self.prompt_bar(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.columns(ui));
+        egui::CentralPanel::default().show(ui, |ui| match self.page {
+            Page::All => self.columns(ui),
+            Page::OpenRouter => self.openrouter_page(ui),
+        });
         if self.show_settings {
             self.settings_window(&ctx);
         }
