@@ -250,7 +250,9 @@ pub fn parse_models(body: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    ids.sort();
+    // I modelli ":batch" non si possono usare in chat; quelli ":free" vanno in cima.
+    ids.retain(|m| !m.ends_with(":batch"));
+    ids.sort_by(|a, b| (!a.ends_with(":free"), a).cmp(&(!b.ends_with(":free"), b)));
     ids.dedup();
     ids
 }
@@ -314,6 +316,12 @@ mod tests {
         assert!(http_error(429, "slow down").contains("slow down"));
         assert!(http_error(503, "").contains("servizio"));
         assert!(http_error(418, "").contains("418"));
+    }
+
+    #[test]
+    fn batch_models_are_hidden_and_free_ones_come_first() {
+        let b = r#"{"data":[{"id":"x/m"},{"id":"x/m:batch"},{"id":"a/z:free"},{"id":"b/y:free"}]}"#;
+        assert_eq!(parse_models(b), vec!["a/z:free", "b/y:free", "x/m"]);
     }
 
     #[test]
