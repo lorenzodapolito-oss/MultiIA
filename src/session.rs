@@ -21,6 +21,8 @@ pub struct Panel {
     pub reasoning: String,
     pub status: Status,
     pub usage: Option<(u64, u64)>,
+    /// Avviso breve mostrato accanto allo stato (per esempio «riprovo»).
+    pub note: Option<String>,
     /// Numero dell'invio in corso: gli eventi di invii vecchi si ignorano.
     pub run: u64,
     started: Option<Instant>,
@@ -36,6 +38,7 @@ impl Panel {
             reasoning: String::new(),
             status: Status::Idle,
             usage: None,
+            note: None,
             run: 0,
             started: None,
             elapsed: Duration::ZERO,
@@ -53,6 +56,7 @@ impl Panel {
         self.text.clear();
         self.reasoning.clear();
         self.usage = None;
+        self.note = None;
         self.status = Status::Running;
         self.run += 1;
         self.started = Some(Instant::now());
@@ -105,10 +109,17 @@ impl Panel {
         }
         match ev {
             Event::Started => {}
-            Event::Text(t) => self.text.push_str(&t),
+            Event::Retry { attempt, max } => {
+                self.note = Some(format!("servizio occupato, riprovo ({attempt}/{max})"));
+            }
+            Event::Text(t) => {
+                self.note = None;
+                self.text.push_str(&t);
+            }
             Event::Reasoning(t) => self.reasoning.push_str(&t),
             Event::Usage { prompt, completion } => self.usage = Some((prompt, completion)),
             Event::Done => {
+                self.note = None;
                 self.finish();
                 if self.text.trim().is_empty() {
                     self.drop_pending_question();
@@ -119,6 +130,7 @@ impl Panel {
                 }
             }
             Event::Error(e) => {
+                self.note = None;
                 self.finish();
                 self.drop_pending_question();
                 self.status = Status::Failed(e);
@@ -222,6 +234,19 @@ mod tests {
         p.apply(Event::Done);
         assert_eq!(p.status, Status::Failed("Risposta vuota".into()));
         assert!(p.history.is_empty());
+    }
+
+    #[test]
+    fn retry_notice_is_shown_then_cleared_by_text() {
+        let mut p = Panel::new("a");
+        p.begin("q");
+        p.apply(Event::Retry { attempt: 1, max: 2 });
+        assert!(p.note.as_deref().is_some_and(|n| n.contains("1/2")));
+        p.apply(Event::Text("x".into()));
+        assert!(p.note.is_none());
+        p.apply(Event::Retry { attempt: 2, max: 2 });
+        p.apply(Event::Error("e".into()));
+        assert!(p.note.is_none());
     }
 
     #[test]

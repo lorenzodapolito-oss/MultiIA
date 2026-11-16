@@ -23,6 +23,11 @@ impl Message {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// Il servizio era sovraccarico: si riprova (tentativo `attempt` di `max`).
+    Retry {
+        attempt: u32,
+        max: u32,
+    },
     /// Il turno di questa IA è arrivato e la richiesta parte.
     Started,
     Text(String),
@@ -34,6 +39,31 @@ pub enum Event {
     },
     Done,
     Error(String),
+}
+
+/// Quante volte si riprova dopo un errore passeggero.
+pub const RETRIES: u32 = 2;
+
+/// 429 (limite), 502/503/504 (servizio sovraccarico o non raggiungibile): passano da soli.
+pub fn is_retryable(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504)
+}
+
+/// Pausa prima del tentativo `n`: 2 secondi, poi 4.
+pub fn retry_delay(n: u32) -> Duration {
+    Duration::from_secs(2 * u64::from(n.max(1)))
+}
+
+/// Aspetta controllando ogni 100 ms se l'utente ha annullato. Falso se annullato.
+fn wait(d: Duration, cancel: &AtomicBool) -> bool {
+    let end = std::time::Instant::now() + d;
+    while std::time::Instant::now() < end {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !cancel.load(Ordering::SeqCst)
 }
 
 pub fn chat_url(base: &str) -> String {
@@ -177,25 +207,42 @@ pub fn stream_chat(
     cancel: &AtomicBool,
     emit: &mut dyn FnMut(Event),
 ) {
-    let mut req = agent(timeout)
-        .post(&chat_url(&p.base_url))
-        .set("Content-Type", "application/json");
-    if !p.api_key.trim().is_empty() {
-        req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
-    }
-    if p.base_url.contains("openrouter.ai") {
-        req = req.set("X-Title", "MultiIA");
-    }
-    let resp = match req.send_string(&build_body(&p.model, system, msgs, max_tokens)) {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            emit(Event::Error(http_error(code, &body)));
-            return;
+    let body = build_body(&p.model, system, msgs, max_tokens);
+    let mut attempt = 0;
+    let resp = loop {
+        let mut req = agent(timeout)
+            .post(&chat_url(&p.base_url))
+            .set("Content-Type", "application/json");
+        if !p.api_key.trim().is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
         }
-        Err(e) => {
-            emit(Event::Error(transport_error(&e)));
-            return;
+        if p.base_url.contains("openrouter.ai") {
+            req = req.set("X-Title", "MultiIA");
+        }
+        match req.send_string(&body) {
+            Ok(r) => break r,
+            Err(ureq::Error::Status(code, r)) => {
+                // Servizio sovraccarico o limite al minuto: si riprova dopo una pausa.
+                if is_retryable(code) && attempt < RETRIES {
+                    attempt += 1;
+                    emit(Event::Retry {
+                        attempt,
+                        max: RETRIES,
+                    });
+                    if !wait(retry_delay(attempt), cancel) {
+                        emit(Event::Done);
+                        return;
+                    }
+                    continue;
+                }
+                let text = r.into_string().unwrap_or_default();
+                emit(Event::Error(http_error(code, &text)));
+                return;
+            }
+            Err(e) => {
+                emit(Event::Error(transport_error(&e)));
+                return;
+            }
         }
     };
     let mut got_text = false;
@@ -229,7 +276,7 @@ pub fn stream_chat(
                     emit(ev);
                     return;
                 }
-                Event::Usage { .. } | Event::Started => {}
+                Event::Usage { .. } | Event::Started | Event::Retry { .. } => {}
             }
             emit(ev);
         }
@@ -362,6 +409,18 @@ pub fn parse_models(body: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_passing_errors_are_retried() {
+        for c in [429, 502, 503, 504] {
+            assert!(is_retryable(c), "{c}");
+        }
+        for c in [400, 401, 402, 404, 500] {
+            assert!(!is_retryable(c), "{c}");
+        }
+        assert_eq!(retry_delay(1), Duration::from_secs(2));
+        assert_eq!(retry_delay(2), Duration::from_secs(4));
+    }
 
     #[test]
     fn urls_are_joined_without_double_slashes() {

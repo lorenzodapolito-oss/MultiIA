@@ -6,13 +6,40 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::AtomicBool;
 
+/// Legge tutta la richiesta (intestazioni e corpo): se il finto servizio chiudesse prima,
+/// il client riceverebbe un reset invece della risposta.
+fn read_request(s: &mut std::net::TcpStream) {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok(n) = s.read(&mut buf) else { return };
+        if n == 0 {
+            return;
+        }
+        data.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&data).to_string();
+        if let Some(i) = text.find("\r\n\r\n") {
+            let len = text[..i]
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if data.len() >= i + 4 + len {
+                return;
+            }
+        }
+    }
+}
+
 fn serve(response: &'static str) -> String {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     std::thread::spawn(move || {
         if let Ok((mut s, _)) = l.accept() {
-            let mut buf = [0u8; 8192];
-            let _ = s.read(&mut buf);
+            read_request(&mut s);
             let _ = s.write_all(response.as_bytes());
         }
     });
@@ -63,7 +90,7 @@ fn streams_text_reasoning_and_usage() {
 #[test]
 fn http_errors_become_one_error_event() {
     let ev = run(serve("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"bad key\"}}"));
-    assert_eq!(ev.len(), 1);
+    assert_eq!(ev.len(), 1, "{ev:?}");
     assert!(matches!(&ev[0], Event::Error(e) if e.contains("Chiave API") && e.contains("bad key")));
 }
 
@@ -84,4 +111,31 @@ fn lists_models() {
     let url = serve("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"b\"},{\"id\":\"a\"}]}");
     let p = Provider::new("t", &url, "m");
     assert_eq!(list_models(&p, 10).unwrap(), vec!["a", "b"]);
+}
+
+/// Servizio che risponde 503 la prima volta e bene la seconda.
+fn serve_flaky() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for (i, conn) in l.incoming().take(2).enumerate() {
+            let Ok(mut s) = conn else { continue };
+            read_request(&mut s);
+            let r = if i == 0 {
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n[{\"error\":{\"message\":\"overloaded\"}}]"
+            } else {
+                OK
+            };
+            let _ = s.write_all(r.as_bytes());
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+#[test]
+fn an_overloaded_service_is_retried_automatically() {
+    let ev = run(serve_flaky());
+    assert_eq!(ev.first(), Some(&Event::Retry { attempt: 1, max: 2 }));
+    assert!(ev.contains(&Event::Text("Cia".into())));
+    assert_eq!(ev.last(), Some(&Event::Done));
 }
