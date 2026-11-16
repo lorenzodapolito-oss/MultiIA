@@ -145,7 +145,7 @@ pub fn free_providers() -> Vec<Provider> {
         Provider::new(
             "Gemini (Google)",
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
         ),
         Provider::new(
             "Groq",

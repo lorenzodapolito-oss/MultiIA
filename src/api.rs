@@ -119,8 +119,13 @@ fn error_text(e: &Value) -> String {
 
 /// Messaggio in italiano per un errore HTTP, con il motivo dato dal servizio.
 pub fn http_error(status: u16, body: &str) -> String {
-    let detail = serde_json::from_str::<Value>(body)
-        .ok()
+    // Alcuni servizi (Gemini) mandano l'errore dentro una lista: `[{"error": {...}}]`.
+    let parsed = serde_json::from_str::<Value>(body).ok().map(|v| match v {
+        Value::Array(mut a) if !a.is_empty() => a.remove(0),
+        other => other,
+    });
+    let detail = parsed
+        .as_ref()
         .and_then(|v| {
             v.get("error")
                 .map(error_text)
@@ -409,6 +414,12 @@ mod tests {
     fn batch_models_are_hidden_and_free_ones_come_first() {
         let b = r#"{"data":[{"id":"x/m"},{"id":"x/m:batch"},{"id":"a/z:free"},{"id":"b/y:free"}]}"#;
         assert_eq!(parse_models(b), vec!["a/z:free", "b/y:free", "x/m"]);
+    }
+
+    #[test]
+    fn errors_wrapped_in_a_list_are_read_too() {
+        let e = http_error(404, r#"[{"error":{"code":404,"message":"model gone"}}]"#);
+        assert!(e.contains("model gone") && !e.contains("[{"));
     }
 
     #[test]
