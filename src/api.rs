@@ -308,6 +308,30 @@ pub fn list_free_models(timeout: u64) -> Result<Vec<String>, String> {
     }
 }
 
+const NOT_CHAT: [&str; 15] = [
+    "tts",
+    "embed",
+    "imagen",
+    "image",
+    "veo",
+    "audio",
+    "live",
+    "whisper",
+    "moderation",
+    "rerank",
+    "transcribe",
+    "aqa",
+    "guard",
+    "dall-e",
+    "speech",
+];
+
+/// Falso per i modelli che non sono pensati per la chat testuale.
+pub fn is_chat_model(id: &str) -> bool {
+    let l = id.to_lowercase();
+    !NOT_CHAT.iter().any(|w| l.contains(w))
+}
+
 pub fn parse_models(body: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Vec::new();
@@ -321,8 +345,15 @@ pub fn parse_models(body: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    // I modelli ":batch" non si possono usare in chat; quelli ":free" vanno in cima.
-    ids.retain(|m| !m.ends_with(":batch"));
+    // Gemini elenca i nomi come «models/nome»; la chat li accetta anche senza prefisso.
+    for m in &mut ids {
+        if let Some(r) = m.strip_prefix("models/") {
+            *m = r.to_string();
+        }
+    }
+    // Niente modelli che non scrivono testo (voce, immagini, video, embedding...) né ":batch";
+    // quelli ":free" vanno in cima.
+    ids.retain(|m| !m.ends_with(":batch") && is_chat_model(m));
     ids.sort_by(|a, b| (!a.ends_with(":free"), a).cmp(&(!b.ends_with(":free"), b)));
     ids.dedup();
     ids
@@ -420,6 +451,13 @@ mod tests {
     fn errors_wrapped_in_a_list_are_read_too() {
         let e = http_error(404, r#"[{"error":{"code":404,"message":"model gone"}}]"#);
         assert!(e.contains("model gone") && !e.contains("[{"));
+    }
+
+    #[test]
+    fn non_chat_models_are_hidden_and_gemini_prefix_removed() {
+        let b = r#"{"data":[{"id":"models/gemini-3.8-flash"},{"id":"models/gemini-3.8-flash-tts"},{"id":"models/text-embedding-9"},{"id":"models/imagen-5"},{"id":"gpt-image-2"},{"id":"whisper-large"},{"id":"llama-3.3-70b"}]}"#;
+        assert_eq!(parse_models(b), vec!["gemini-3.8-flash", "llama-3.3-70b"]);
+        assert!(is_chat_model("mistral-small-latest") && !is_chat_model("x-TTS-y"));
     }
 
     #[test]
