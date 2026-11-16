@@ -2,7 +2,7 @@
 
 Una domanda, più IA insieme: ogni IA risponde in una colonna, in streaming, e puoi confrontarle fianco a fianco. Scritto in Rust con egui.
 
-- **Pronte**: DeepSeek, Grok (xAI), GLM (Z.ai). Si aggiungono con un clic ChatGPT, Mistral, OpenRouter, Ollama (sul tuo PC) o qualunque servizio compatibile OpenAI.
+- **Pronte**: ChatGPT, Claude, Gemini, DeepSeek, Grok (xAI), GLM (Z.ai). Con un clic si aggiungono anche Mistral, OpenRouter, Ollama (sul tuo PC) o qualunque servizio compatibile OpenAI. I nomi dei modelli si cambiano in Impostazioni (o con «Cerca modelli»).
 - Risposte in tempo reale, con tempo impiegato, token usati e «ragionamento» dei modelli che lo mostrano.
 - Conversazione continua: ogni IA ricorda i messaggi precedenti. «Nuova chat» riparte da zero.
 - **Annulla** ferma tutte le IA tenendo ciò che è già arrivato; un errore su una IA non blocca le altre.

@@ -78,6 +78,21 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             providers: vec![
+                Provider::new(
+                    "ChatGPT (OpenAI)",
+                    "https://api.openai.com/v1",
+                    "gpt-6.1-sol",
+                ),
+                Provider::new(
+                    "Claude (Anthropic)",
+                    "https://api.anthropic.com/v1",
+                    "claude-sonnet-5-5",
+                ),
+                Provider::new(
+                    "Gemini (Google)",
+                    "https://generativelanguage.googleapis.com/v1beta/openai",
+                    "gemini-2.5-pro",
+                ),
                 Provider::new("DeepSeek", "https://api.deepseek.com", "deepseek-flash"),
                 Provider::new("Grok (xAI)", "https://api.x.ai/v1", "grok-4.7"),
                 Provider::new("GLM (Z.ai)", "https://api.z.ai/api/paas/v4", "glm-5.3"),
@@ -91,7 +106,21 @@ impl Default for Settings {
 /// Modelli già pronti da aggiungere con un clic.
 pub fn presets() -> Vec<Provider> {
     vec![
-        Provider::new("ChatGPT (OpenAI)", "https://api.openai.com/v1", "gpt-5"),
+        Provider::new(
+            "ChatGPT (OpenAI)",
+            "https://api.openai.com/v1",
+            "gpt-6.1-sol",
+        ),
+        Provider::new(
+            "Claude (Anthropic)",
+            "https://api.anthropic.com/v1",
+            "claude-sonnet-5-5",
+        ),
+        Provider::new(
+            "Gemini (Google)",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-2.5-pro",
+        ),
         Provider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
@@ -99,6 +128,7 @@ pub fn presets() -> Vec<Provider> {
         ),
         Provider::new("OpenRouter", "https://openrouter.ai/api/v1", ""),
         Provider::new("Ollama (sul tuo PC)", "http://localhost:11434/v1", ""),
+        Provider::new("LM Studio (sul tuo PC)", "http://localhost:1234/v1", ""),
         Provider::new("DeepSeek", "https://api.deepseek.com", "deepseek-flash"),
         Provider::new("Grok (xAI)", "https://api.x.ai/v1", "grok-4.7"),
         Provider::new("GLM (Z.ai)", "https://api.z.ai/api/paas/v4", "glm-5.3"),
@@ -169,13 +199,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_have_three_distinct_providers() {
+    fn defaults_have_six_distinct_providers() {
         let s = Settings::default();
-        assert_eq!(s.providers.len(), 3);
+        assert_eq!(s.providers.len(), 6);
         let mut ids: Vec<_> = s.providers.iter().map(|p| p.id.clone()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 6);
         assert!(s
             .providers
             .iter()
@@ -227,8 +257,8 @@ mod tests {
         save(&f, &s).unwrap();
         assert_eq!(load(&f).providers[0].api_key, "segreta");
         std::fs::write(&f, "{rotto").unwrap();
-        assert_eq!(load(&f).providers.len(), 3);
-        assert_eq!(load(&d.join("manca.json")).providers.len(), 3);
+        assert_eq!(load(&f).providers.len(), 6);
+        assert_eq!(load(&d.join("manca.json")).providers.len(), 6);
         let _ = std::fs::remove_dir_all(&d);
     }
 
