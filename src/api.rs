@@ -293,7 +293,11 @@ pub fn list_models(p: &Provider, timeout: u64) -> Result<Vec<String>, String> {
     match req.call() {
         Ok(r) => {
             let body = r.into_string().map_err(|e| e.to_string())?;
-            Ok(parse_models(&body))
+            Ok(if p.base_url.contains("openrouter.ai") {
+                parse_free_models(&body)
+            } else {
+                parse_models(&body)
+            })
         }
         Err(ureq::Error::Status(c, r)) => Err(http_error(c, &r.into_string().unwrap_or_default())),
         Err(e) => Err(transport_error(&e)),
@@ -302,41 +306,75 @@ pub fn list_models(p: &Provider, timeout: u64) -> Result<Vec<String>, String> {
 
 pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
 
-/// Modelli gratuiti di OpenRouter che rispondono con testo (niente `:batch`, niente a pagamento).
+/// Un modello si può scegliere solo se è attivo (non dismesso), scrive testo ed è gratuito.
+/// `explicit_free`: il servizio mescola modelli a pagamento e gratuiti (OpenRouter), quindi la
+/// gratuità deve essere dichiarata; negli altri, senza prezzi nell'elenco, vale il piano gratuito.
+fn is_active_and_free(m: &Value, explicit_free: bool) -> bool {
+    let id = m.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty()
+        || id.ends_with(":batch")
+        || id.starts_with("openrouter/")
+        || !is_chat_model(id)
+    {
+        return false;
+    }
+    // Inattivo o dismesso: Groq usa "active", altri "deprecated", Mistral una data in "deprecation".
+    if m.get("active").and_then(Value::as_bool) == Some(false)
+        || m.get("deprecated").and_then(Value::as_bool) == Some(true)
+        || m.get("deprecation").is_some_and(|d| !d.is_null())
+    {
+        return false;
+    }
+    let text_out = m
+        .pointer("/architecture/output_modalities")
+        .and_then(Value::as_array)
+        .is_none_or(|o| o.iter().any(|x| x.as_str() == Some("text")));
+    if !text_out {
+        return false;
+    }
+    let price = |k: &str| {
+        m.pointer(&format!("/pricing/{k}")).and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .or_else(|| v.as_f64())
+        })
+    };
+    if id.ends_with(":free") || m.get("free").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    match (price("prompt"), price("completion")) {
+        (Some(p), Some(c)) => p == 0.0 && c == 0.0,
+        _ => !explicit_free,
+    }
+}
+
+/// Modelli gratuiti e attivi di OpenRouter che rispondono con testo.
 pub fn parse_free_models(body: &str) -> Vec<String> {
+    collect_models(body, true)
+}
+
+fn collect_models(body: &str, explicit_free: bool) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Vec::new();
-    };
-    let zero = |m: &Value, k: &str| {
-        m.pointer(&format!("/pricing/{k}"))
-            .and_then(Value::as_str)
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            == Some(0.0)
     };
     let mut ids: Vec<String> = v
         .get("data")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter(|m| {
-                    let id = m.get("id").and_then(Value::as_str).unwrap_or("");
-                    let free =
-                        id.ends_with(":free") || (zero(m, "prompt") && zero(m, "completion"));
-                    let text_out = m
-                        .pointer("/architecture/output_modalities")
-                        .and_then(Value::as_array)
-                        .is_none_or(|o| o.iter().any(|x| x.as_str() == Some("text")));
-                    !id.is_empty()
-                        && !id.ends_with(":batch")
-                        && !id.starts_with("openrouter/")
-                        && free
-                        && text_out
-                })
+                .filter(|m| is_active_and_free(m, explicit_free))
                 .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
                 .collect()
         })
         .unwrap_or_default();
-    ids.sort();
+    // Gemini elenca i nomi come «models/nome»; la chat li accetta anche senza prefisso.
+    for m in &mut ids {
+        if let Some(r) = m.strip_prefix("models/") {
+            *m = r.to_string();
+        }
+    }
+    // I ":free" vanno in cima.
+    ids.sort_by(|a, b| (!a.ends_with(":free"), a).cmp(&(!b.ends_with(":free"), b)));
     ids.dedup();
     ids
 }
@@ -379,31 +417,9 @@ pub fn is_chat_model(id: &str) -> bool {
     !NOT_CHAT.iter().any(|w| l.contains(w))
 }
 
+/// Modelli attivi e utilizzabili gratuitamente offerti dal servizio.
 pub fn parse_models(body: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<Value>(body) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = v
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    // Gemini elenca i nomi come «models/nome»; la chat li accetta anche senza prefisso.
-    for m in &mut ids {
-        if let Some(r) = m.strip_prefix("models/") {
-            *m = r.to_string();
-        }
-    }
-    // Niente modelli che non scrivono testo (voce, immagini, video, embedding...) né ":batch";
-    // quelli ":free" vanno in cima.
-    ids.retain(|m| !m.ends_with(":batch") && is_chat_model(m));
-    ids.sort_by(|a, b| (!a.ends_with(":free"), a).cmp(&(!b.ends_with(":free"), b)));
-    ids.dedup();
-    ids
+    collect_models(body, false)
 }
 
 #[cfg(test)]
@@ -495,7 +511,7 @@ mod tests {
           {"x":1}]}"#;
         assert_eq!(
             parse_free_models(b),
-            vec!["a/free:free", "b/zero", "f/mix:free"]
+            vec!["a/free:free", "f/mix:free", "b/zero"]
         );
         assert!(parse_free_models("rotto").is_empty());
     }
@@ -517,6 +533,21 @@ mod tests {
         let b = r#"{"data":[{"id":"models/gemini-3.8-flash"},{"id":"models/gemini-3.8-flash-tts"},{"id":"models/text-embedding-9"},{"id":"models/imagen-5"},{"id":"gpt-image-2"},{"id":"whisper-large"},{"id":"llama-3.3-70b"}]}"#;
         assert_eq!(parse_models(b), vec!["gemini-3.8-flash", "llama-3.3-70b"]);
         assert!(is_chat_model("mistral-small-latest") && !is_chat_model("x-TTS-y"));
+    }
+
+    #[test]
+    fn inactive_deprecated_and_paid_models_cannot_be_chosen() {
+        let b = r#"{"data":[
+          {"id":"ok"},
+          {"id":"spento","active":false},
+          {"id":"vecchio","deprecated":true},
+          {"id":"mistral-old","deprecation":"2026-12-01T00:00:00Z"},
+          {"id":"mistral-new","deprecation":null},
+          {"id":"costa","pricing":{"prompt":"0.001","completion":"0.002"}},
+          {"id":"gratis","pricing":{"prompt":0,"completion":0}}]}"#;
+        assert_eq!(parse_models(b), vec!["gratis", "mistral-new", "ok"]);
+        // Su OpenRouter la gratuità deve essere dichiarata: senza prezzi non vale.
+        assert_eq!(parse_free_models(b), vec!["gratis"]);
     }
 
     #[test]

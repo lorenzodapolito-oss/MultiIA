@@ -751,6 +751,11 @@ impl App {
                         if let Some(n) = self.model_note.get(&p.id) {
                             ui.label(RichText::new(n).color(theme::MUTED));
                         }
+                        if let Some(list) = self.models.get(&p.id) {
+                            if !p.model.is_empty() && !list.contains(&p.model) {
+                                ui.colored_label(theme::ERR, "Questo modello non è tra quelli attivi e gratuiti dell'elenco: scegline uno con la lista.");
+                            }
+                        }
                     });
                     ui.add_space(4.0);
                 }
