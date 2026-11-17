@@ -2,7 +2,7 @@
 
 Una domanda, più IA insieme: ogni IA risponde in una colonna, in streaming, e puoi confrontarle fianco a fianco. Scritto in Rust con egui.
 
-- **Solo IA con piano gratuito per l'API** (serve comunque una chiave, ma gratuita): Gemini, Groq, Cerebras, Mistral, NVIDIA e GitHub Models. Si possono aggiungere anche Ollama e LM Studio (sul tuo PC) o qualunque servizio compatibile OpenAI. I limiti gratuiti e i nomi dei modelli cambiano: «Cerca modelli» in Impostazioni mostra quelli disponibili.
+- **Solo IA con piano gratuito per l'API** (serve comunque una chiave, ma gratuita): Gemini, Groq, Mistral, NVIDIA e GitHub Models. Si possono aggiungere anche Ollama e LM Studio (sul tuo PC) o qualunque servizio compatibile OpenAI. I limiti gratuiti e i nomi dei modelli cambiano: «Cerca modelli» in Impostazioni mostra quelli disponibili.
 - **Due pagine**: «Tutte le IA» (una colonna per servizio) e «OpenRouter», con una chat separata per **ogni modello gratuito** disponibile (l'elenco si legge da OpenRouter; i modelli a pagamento non compaiono). Si possono spegnere i modelli che non servono; le richieste partono 4 alla volta per rispettare i limiti dei piani gratuiti.
 - Risposte in tempo reale, con tempo impiegato, token usati e «ragionamento» dei modelli che lo mostrano.
 - Conversazione continua: ogni IA ricorda i messaggi precedenti. «Nuova chat» riparte da zero.

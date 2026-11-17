@@ -12,13 +12,14 @@ fn zero() -> u32 {
 }
 
 /// Servizi a pagamento tolti dall'elenco dalla versione 2.
-const PAID_HOSTS: [&str; 6] = [
+const PAID_HOSTS: [&str; 7] = [
     "api.openai.com",
     "api.anthropic.com",
     "api.deepseek.com",
     "api.x.ai",
     "api.z.ai",
     "openrouter.ai",
+    "api.cerebras.ai",
 ];
 
 fn host(url: &str) -> String {
@@ -155,7 +156,6 @@ pub fn free_providers() -> Vec<Provider> {
             "https://api.groq.com/openai/v1",
             "llama-3.3-70b-versatile",
         ),
-        Provider::new("Cerebras", "https://api.cerebras.ai/v1", "llama-3.3-70b"),
         Provider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
@@ -263,13 +263,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_have_six_distinct_providers() {
+    fn defaults_have_five_distinct_providers() {
         let s = Settings::default();
-        assert_eq!(s.providers.len(), 6);
+        assert_eq!(s.providers.len(), 5);
         let mut ids: Vec<_> = s.providers.iter().map(|p| p.id.clone()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 5);
         assert!(s
             .providers
             .iter()
@@ -331,8 +331,8 @@ mod tests {
         save(&f, &s).unwrap();
         assert_eq!(load(&f).providers[0].api_key, "segreta");
         std::fs::write(&f, "{rotto").unwrap();
-        assert_eq!(load(&f).providers.len(), 6);
-        assert_eq!(load(&d.join("manca.json")).providers.len(), 6);
+        assert_eq!(load(&f).providers.len(), 5);
+        assert_eq!(load(&d.join("manca.json")).providers.len(), 5);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(s.version, VERSION);
         let names: Vec<_> = s.providers.iter().map(|p| p.name.as_str()).collect();
         assert!(!names.contains(&"ChatGPT") && !names.contains(&"Grok"));
-        assert!(names.contains(&"Mia") && names.contains(&"Groq") && names.contains(&"Cerebras"));
+        assert!(names.contains(&"Mia") && names.contains(&"Groq") && !names.contains(&"Cerebras"));
         assert_eq!(
             s.providers
                 .iter()
