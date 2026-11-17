@@ -82,6 +82,9 @@ pub struct App {
     /// Verifiche in corso: scope → (fatte, totale, funzionano, scartati).
     verifying: HashMap<String, (usize, usize, usize, usize)>,
     show_bad: bool,
+    /// Segnali di stop per verifiche e ricerche in corso (chiave: id dell'IA o «openrouter»).
+    verify_cancel: HashMap<String, Arc<AtomicBool>>,
+    fetch_cancel: HashMap<String, Arc<AtomicBool>>,
     model_note: HashMap<String, String>,
 }
 
@@ -222,6 +225,8 @@ impl App {
             ranked: HashMap::new(),
             verifying: HashMap::new(),
             show_bad: false,
+            verify_cancel: HashMap::new(),
+            fetch_cancel: HashMap::new(),
             model_note: HashMap::new(),
         };
         app.sync_panels();
@@ -443,6 +448,8 @@ impl App {
         }
         self.or_loading = true;
         self.or_note = "Cerco i modelli gratuiti…".into();
+        self.fetch_cancel
+            .insert("openrouter".into(), Arc::new(AtomicBool::new(false)));
         let (tx, ctx, t) = (self.tx.clone(), ctx.clone(), self.settings.timeout_secs);
         std::thread::spawn(move || {
             let _ = tx.send(Msg::FreeModels(api::list_free_models(t)));
@@ -461,6 +468,11 @@ impl App {
             }
             .into(),
         );
+        if self.fetch_cancel.contains_key(&p.id) {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.fetch_cancel.insert(p.id.clone(), stop.clone());
         let (tx, ctx, p, t) = (
             self.tx.clone(),
             ctx.clone(),
@@ -470,7 +482,7 @@ impl App {
         std::thread::spawn(move || {
             let res = api::list_models_ranked(&p, t).map(|(list, ranked)| {
                 let best = if pick {
-                    api::pick_working(&p, &ranked, t)
+                    api::pick_working_cancel(&p, &ranked, t, &stop)
                 } else {
                     None
                 };
@@ -483,6 +495,31 @@ impl App {
             });
             ctx.request_repaint();
         });
+    }
+
+    /// Ferma la verifica: gli esiti già ottenuti restano, quelli in arrivo si ignorano.
+    fn stop_verify(&mut self, scope: &str) {
+        if let Some(f) = self.verify_cancel.remove(scope) {
+            f.store(true, Ordering::SeqCst);
+        }
+        if self.verifying.remove(scope).is_some() {
+            self.message = "Verifica fermata: gli esiti già ottenuti restano salvati.".into();
+            self.save_settings();
+        }
+    }
+
+    /// Ferma la ricerca dei modelli (l'elenco che arriva dopo si ignora).
+    fn stop_fetch(&mut self, id: &str) {
+        if let Some(f) = self.fetch_cancel.remove(id) {
+            f.store(true, Ordering::SeqCst);
+        }
+        if id == "openrouter" {
+            self.or_loading = false;
+            self.or_note = "Ricerca fermata.".into();
+        } else {
+            self.model_note
+                .insert(id.to_string(), "Ricerca fermata.".into());
+        }
     }
 
     /// Esito noto di un modello: Some(true) funziona, Some(false) scartato, None non verificato.
@@ -507,17 +544,23 @@ impl App {
         }
         self.verifying
             .insert(scope.to_string(), (0, models.len(), 0, 0));
+        let stop = Arc::new(AtomicBool::new(false));
+        self.verify_cancel.insert(scope.to_string(), stop.clone());
         let queue = Arc::new(Mutex::new(VecDeque::from(models.clone())));
         for _ in 0..OR_WORKERS.min(models.len()) {
-            let (queue, tx, ctx, base, scope) = (
+            let (queue, tx, ctx, base, scope, stop) = (
                 queue.clone(),
                 self.tx.clone(),
                 ctx.clone(),
                 base.clone(),
                 scope.to_string(),
+                stop.clone(),
             );
             let t = self.settings.timeout_secs;
             std::thread::spawn(move || loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 let next = queue.lock().ok().and_then(|mut q| q.pop_front());
                 let Some(model) = next else { break };
                 let p = Provider {
@@ -549,6 +592,9 @@ impl App {
                     }
                 }
                 Msg::FreeModels(res) => {
+                    if self.fetch_cancel.remove("openrouter").is_none() {
+                        continue; // l'utente ha fermato la ricerca
+                    }
                     self.or_loading = false;
                     match res {
                         Ok(list) if list.is_empty() => {
@@ -567,6 +613,9 @@ impl App {
                     model,
                     verdict,
                 } => {
+                    if !self.verifying.contains_key(&scope) {
+                        continue; // verifica fermata: esito tardivo
+                    }
                     let entry = self.settings.checked.entry(scope.clone()).or_default();
                     let prog = self.verifying.entry(scope.clone()).or_insert((0, 0, 0, 0));
                     prog.0 += 1;
@@ -586,6 +635,7 @@ impl App {
                     if prog.0 >= prog.1 {
                         let (_, total, ok, bad) = *prog;
                         self.verifying.remove(&scope);
+                        self.verify_cancel.remove(&scope);
                         self.message = format!(
                             "Verifica finita: {ok} funzionano, {bad} scartati, {} non verificabili ora (sovraccarichi o limite raggiunto).",
                             total.saturating_sub(ok + bad)
@@ -594,6 +644,9 @@ impl App {
                     }
                 }
                 Msg::Models { id, pick, res } => {
+                    if self.fetch_cancel.remove(&id).is_none() {
+                        continue; // l'utente ha fermato la ricerca
+                    }
                     match res {
                         Ok((list, _, _)) if list.is_empty() => {
                             self.model_note.insert(
@@ -727,18 +780,28 @@ impl App {
             ui.vertical(|ui| {
                 let enter =
                     ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
-                let label = if running {
-                    "In corso…"
+                if running {
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    let b = ui.add(
+                        egui::Button::new(RichText::new("Ferma").color(theme::ON_COLOR).strong())
+                            .fill(theme::BTN_PINK),
+                    );
+                    if b.clicked() || esc {
+                        self.cancel_all();
+                    }
+                    ui.label(RichText::new("o premi Esc").color(theme::MUTED));
                 } else {
-                    "Invia a tutte"
-                };
-                let b = ui.add_enabled(
-                    !running,
-                    egui::Button::new(RichText::new(label).color(theme::ON_COLOR).strong())
+                    let b = ui.add(
+                        egui::Button::new(
+                            RichText::new("Invia a tutte")
+                                .color(theme::ON_COLOR)
+                                .strong(),
+                        )
                         .fill(theme::BTN_MINT),
-                );
-                if (b.clicked() || enter) && !running {
-                    self.send(&ctx);
+                    );
+                    if b.clicked() || enter {
+                        self.send(&ctx);
+                    }
                 }
             });
         });
@@ -804,7 +867,11 @@ impl App {
             if r.lost_focus() {
                 save = true;
             }
-            if color_button(ui, "Aggiorna elenco", theme::BTN_MINT).clicked() {
+            if self.or_loading {
+                if color_button(ui, "Ferma la ricerca", theme::BTN_PINK).clicked() {
+                    self.stop_fetch("openrouter");
+                }
+            } else if color_button(ui, "Aggiorna elenco", theme::BTN_MINT).clicked() {
                 self.fetch_free_models(&ctx);
             }
             ui.label(RichText::new(&self.or_note).color(theme::MUTED));
@@ -823,6 +890,9 @@ impl App {
                 let base = or_provider("", &self.settings.openrouter_key);
                 let models: Vec<String> = self.or_models.iter().filter(|m| self.or_enabled(m)).cloned().collect();
                 self.start_verify(&ctx, "openrouter", &base, models);
+            }
+            if busy.is_some() && color_button(ui, "Ferma la verifica", theme::BTN_PINK).clicked() {
+                self.stop_verify("openrouter");
             }
             ui.checkbox(&mut self.show_bad, "Mostra anche gli scartati");
             let known = self.settings.checked.get("openrouter");
@@ -948,6 +1018,8 @@ impl App {
         let mut delete: Option<usize> = None;
         let mut fetch: Option<(Provider, bool)> = None;
         let mut verify: Option<Provider> = None;
+        let mut stop_fetch: Option<String> = None;
+        let mut stop_verify: Option<String> = None;
         let mut add: Option<Provider> = None;
         egui::Window::new("Impostazioni").open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.label(RichText::new("Le chiavi restano solo su questo PC, nel file delle impostazioni di MultiIA.").color(theme::MUTED));
@@ -985,11 +1057,22 @@ impl App {
                                         }
                                     });
                                 }
-                                if ui.small_button("Cerca modelli").clicked() {
-                                    fetch = Some((p.clone(), false));
+                                if self.fetch_cancel.contains_key(&p.id) {
+                                    if ui.small_button("Ferma la ricerca").clicked() {
+                                        stop_fetch = Some(p.id.clone());
+                                    }
+                                } else {
+                                    if ui.small_button("Cerca modelli").clicked() {
+                                        fetch = Some((p.clone(), false));
+                                    }
+                                    if ui.small_button("Scegli il migliore").clicked() {
+                                        fetch = Some((p.clone(), true));
+                                    }
                                 }
-                                if ui.small_button("Scegli il migliore").clicked() {
-                                    fetch = Some((p.clone(), true));
+                                if self.verifying.contains_key(&p.id)
+                                    && ui.small_button("Ferma la verifica").clicked()
+                                {
+                                    stop_verify = Some(p.id.clone());
                                 }
                                 let busy = self.verifying.contains_key(&p.id);
                                 let can = !busy && self.models.contains_key(&p.id);
@@ -1045,6 +1128,12 @@ impl App {
             if self.settings.providers.len() < config::MAX_PROVIDERS {
                 self.settings.providers.push(p);
             }
+        }
+        if let Some(id) = stop_fetch {
+            self.stop_fetch(&id);
+        }
+        if let Some(id) = stop_verify {
+            self.stop_verify(&id);
         }
         if let Some(p) = verify {
             // I 12 più recenti: ogni prova usa una richiesta del piano gratuito.

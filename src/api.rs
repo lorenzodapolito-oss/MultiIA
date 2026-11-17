@@ -577,9 +577,20 @@ pub fn probe_verdict(p: &Provider, model: &str, timeout: u64) -> Verdict {
 
 /// Il primo modello che risponde davvero tra i più recenti (se ne provano al massimo 4).
 pub fn pick_working(p: &Provider, ranked: &[String], timeout: u64) -> Option<String> {
+    pick_working_cancel(p, ranked, timeout, &AtomicBool::new(false))
+}
+
+/// Come `pick_working`, ma si ferma subito se `cancel` diventa vero.
+pub fn pick_working_cancel(
+    p: &Provider,
+    ranked: &[String],
+    timeout: u64,
+    cancel: &AtomicBool,
+) -> Option<String> {
     ranked
         .iter()
         .take(4)
+        .take_while(|_| !cancel.load(Ordering::SeqCst))
         .find(|m| probe_model(p, m, timeout).is_ok())
         .cloned()
 }

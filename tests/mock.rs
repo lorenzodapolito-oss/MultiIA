@@ -207,3 +207,15 @@ fn verdicts_tell_working_broken_and_unsure_apart() {
         Verdict::Unsure(_)
     ));
 }
+
+#[test]
+fn a_stopped_search_makes_no_requests() {
+    use std::sync::atomic::AtomicBool;
+    let p = Provider::new("t", "http://127.0.0.1:1/v1", "x");
+    let stop = AtomicBool::new(true);
+    let ranked: Vec<String> = ["a", "b"].map(String::from).to_vec();
+    assert_eq!(
+        multiia::api::pick_working_cancel(&p, &ranked, 5, &stop),
+        None
+    );
+}
