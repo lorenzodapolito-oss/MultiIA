@@ -111,6 +111,8 @@ pub struct Settings {
     pub openrouter_key: String,
     /// Modelli gratuiti di OpenRouter che l'utente ha spento.
     pub or_disabled: Vec<String>,
+    /// Esito delle verifiche: per ogni IA (o «openrouter») modello → funziona (true) o no (false).
+    pub checked: std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
 }
 
 impl Default for Settings {
@@ -123,6 +125,7 @@ impl Default for Settings {
             max_tokens: 4000,
             openrouter_key: String::new(),
             or_disabled: Vec::new(),
+            checked: Default::default(),
         }
     }
 }
@@ -224,6 +227,16 @@ impl Settings {
         self.max_tokens = self.max_tokens.min(200_000);
         self.openrouter_key = self.openrouter_key.trim().to_string();
         self.or_disabled.truncate(2000);
+        self.checked
+            .retain(|k, _| k == "openrouter" || self.providers.iter().any(|p| &p.id == k));
+        for m in self.checked.values_mut() {
+            while m.len() > 2000 {
+                let Some(k) = m.keys().next().cloned() else {
+                    break;
+                };
+                m.remove(&k);
+            }
+        }
         self
     }
 }
@@ -388,6 +401,32 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    #[test]
+    fn verification_results_are_kept_only_for_known_services() {
+        let mut s = Settings::default();
+        let id = s.providers[0].id.clone();
+        s.checked
+            .entry(id.clone())
+            .or_default()
+            .insert("m".into(), true);
+        s.checked
+            .entry("openrouter".into())
+            .or_default()
+            .insert("x/y:free".into(), false);
+        s.checked
+            .entry("cancellato".into())
+            .or_default()
+            .insert("z".into(), true);
+        let s = s.sanitized();
+        assert!(s.checked.contains_key(&id) && s.checked.contains_key("openrouter"));
+        assert!(!s.checked.contains_key("cancellato"));
+        let t = serde_json::to_string(&s).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Settings>(&t).unwrap().checked,
+            s.checked
+        );
     }
 
     #[test]

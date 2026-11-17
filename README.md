@@ -8,6 +8,7 @@ Una domanda, più IA insieme: ogni IA risponde in una colonna, in streaming, e p
 - Conversazione continua: ogni IA ricorda i messaggi precedenti. «Nuova chat» riparte da zero.
 - **Annulla** ferma tutte le IA tenendo ciò che è già arrivato; un errore su una IA non blocca le altre.
 - Il **modello più recente che funziona** si sceglie da solo all'avvio (si può spegnere per ogni IA): MultiIA prova i più recenti con una richiesta minuscola e prende il primo che risponde; «Scegli il migliore» lo fa a richiesta. La **chiave API** si scrive anche direttamente nella colonna di ogni IA.
+- **Verifica dei modelli**: un pulsante prova ogni modello con una richiesta minuscola; quelli che funzionano vanno in cima (✓), quelli con errore definitivo si scartano (✗, si possono rivedere con «Mostra anche gli scartati»), quelli sovraccarichi o oltre il limite restano «non verificati». Ogni prova usa una richiesta del piano gratuito. L'esito resta salvato.
 - «Cerca modelli» legge l'elenco dei modelli dal servizio; «Esporta risposte» salva tutto in Markdown.
 - Colori solo pastello, mai bianco né grigio.
 

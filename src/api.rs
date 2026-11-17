@@ -532,6 +532,49 @@ pub fn probe_model(p: &Provider, model: &str, timeout: u64) -> Result<(), String
     }
 }
 
+/// Esito della prova di un modello.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// Ha risposto: funziona.
+    Works,
+    /// Errore definitivo (modello inesistente, non permesso, a pagamento...): da scartare.
+    Broken(String),
+    /// Errore passeggero (sovraccarico, limite raggiunto, rete): non si sa, si riprova più tardi.
+    Unsure(String),
+}
+
+/// Prova il modello con una richiesta minuscola e dà un verdetto.
+pub fn probe_verdict(p: &Provider, model: &str, timeout: u64) -> Verdict {
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ciao"}],
+        "max_tokens": 8,
+    })
+    .to_string();
+    let mut req = agent(timeout.min(30))
+        .post(&chat_url(&p.base_url))
+        .set("Content-Type", "application/json");
+    if !p.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
+    }
+    if p.base_url.contains("openrouter.ai") {
+        req = req.set("X-Title", "MultiIA");
+    }
+    match req.send_string(&body) {
+        Ok(_) => Verdict::Works,
+        Err(ureq::Error::Status(c, r)) => {
+            let msg = http_error(c, &r.into_string().unwrap_or_default());
+            // 401/403: il problema è la chiave, non il modello.
+            if is_retryable(c) || c == 408 || c == 401 || c == 403 || c >= 500 {
+                Verdict::Unsure(msg)
+            } else {
+                Verdict::Broken(msg)
+            }
+        }
+        Err(e) => Verdict::Unsure(transport_error(&e)),
+    }
+}
+
 /// Il primo modello che risponde davvero tra i più recenti (se ne provano al massimo 4).
 pub fn pick_working(p: &Provider, ranked: &[String], timeout: u64) -> Option<String> {
     ranked

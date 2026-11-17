@@ -178,3 +178,32 @@ fn no_working_model_gives_none() {
     let ranked: Vec<String> = ["bad-1", "bad-2"].map(String::from).to_vec();
     assert_eq!(multiia::api::pick_working(&p, &ranked, 10), None);
 }
+
+fn serve_status(status: &'static str) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = l.accept() {
+            read_request(&mut s);
+            let _ = s.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"choices\":[],\"error\":{{\"message\":\"x\"}}}}").as_bytes());
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+#[test]
+fn verdicts_tell_working_broken_and_unsure_apart() {
+    use multiia::api::{probe_verdict, Verdict};
+    let v = |status| probe_verdict(&Provider::new("t", &serve_status(status), "m"), "m", 10);
+    assert_eq!(v("200 OK"), Verdict::Works);
+    assert!(matches!(v("404 Not Found"), Verdict::Broken(_)));
+    assert!(matches!(v("402 Payment Required"), Verdict::Broken(_)));
+    assert!(matches!(v("400 Bad Request"), Verdict::Broken(_)));
+    assert!(matches!(v("503 Service Unavailable"), Verdict::Unsure(_)));
+    assert!(matches!(v("429 Too Many Requests"), Verdict::Unsure(_)));
+    assert!(matches!(v("401 Unauthorized"), Verdict::Unsure(_)));
+    assert!(matches!(
+        probe_verdict(&Provider::new("t", "http://127.0.0.1:1/v1", "m"), "m", 5),
+        Verdict::Unsure(_)
+    ));
+}

@@ -1,7 +1,7 @@
 //! Interfaccia: due pagine. «Tutte le IA» (una colonna per ogni servizio) e «OpenRouter»
 //! (una chat per ogni modello gratuito).
 
-use crate::api::{self, Event, Message};
+use crate::api::{self, Event, Message, Verdict};
 use crate::config::{self, Provider, Settings};
 use crate::session::{duration_text, export_markdown, Panel, Status};
 use crate::theme;
@@ -27,6 +27,9 @@ const COLORS: [Color32; 6] = [
     theme::BTN_YELLOW,
 ];
 
+/// Elenco per il menu, elenco dal più recente, modello scelto.
+type Found = (Vec<String>, Vec<String>, Option<String>);
+
 enum Msg {
     Chat {
         id: String,
@@ -36,7 +39,13 @@ enum Msg {
     Models {
         id: String,
         pick: bool,
-        res: Result<(Vec<String>, Option<String>), String>,
+        res: Result<Found, String>,
+    },
+    /// Esito della prova di un modello (`scope`: id dell'IA oppure «openrouter»).
+    Verified {
+        scope: String,
+        model: String,
+        verdict: Verdict,
     },
     FreeModels(Result<Vec<String>, String>),
 }
@@ -69,6 +78,10 @@ pub struct App {
     show_settings: bool,
     message: String,
     models: HashMap<String, Vec<String>>,
+    ranked: HashMap<String, Vec<String>>,
+    /// Verifiche in corso: scope → (fatte, totale, funzionano, scartati).
+    verifying: HashMap<String, (usize, usize, usize, usize)>,
+    show_bad: bool,
     model_note: HashMap<String, String>,
 }
 
@@ -206,6 +219,9 @@ impl App {
             show_settings: false,
             message: String::new(),
             models: HashMap::new(),
+            ranked: HashMap::new(),
+            verifying: HashMap::new(),
+            show_bad: false,
             model_note: HashMap::new(),
         };
         app.sync_panels();
@@ -372,8 +388,10 @@ impl App {
                 }
                 let key = self.settings.openrouter_key.clone();
                 let off: HashSet<&String> = self.settings.or_disabled.iter().collect();
+                let empty = std::collections::BTreeMap::new();
+                let checked = self.settings.checked.get("openrouter").unwrap_or(&empty);
                 for (m, panel) in self.or_models.iter().zip(self.or_panels.iter_mut()) {
-                    if off.contains(m) {
+                    if off.contains(m) || checked.get(m) == Some(&false) {
                         continue;
                     }
                     let msgs = panel.queue(&q);
@@ -456,7 +474,7 @@ impl App {
                 } else {
                     None
                 };
-                (list, best)
+                (list, ranked, best)
             });
             let _ = tx.send(Msg::Models {
                 id: p.id,
@@ -465,6 +483,56 @@ impl App {
             });
             ctx.request_repaint();
         });
+    }
+
+    /// Esito noto di un modello: Some(true) funziona, Some(false) scartato, None non verificato.
+    fn verdict_of(&self, scope: &str, model: &str) -> Option<bool> {
+        self.settings
+            .checked
+            .get(scope)
+            .and_then(|m| m.get(model))
+            .copied()
+    }
+
+    /// Prova ogni modello con una richiesta minuscola (pochi alla volta) e ricorda l'esito.
+    fn start_verify(
+        &mut self,
+        ctx: &egui::Context,
+        scope: &str,
+        base: &Provider,
+        models: Vec<String>,
+    ) {
+        if models.is_empty() || self.verifying.contains_key(scope) {
+            return;
+        }
+        self.verifying
+            .insert(scope.to_string(), (0, models.len(), 0, 0));
+        let queue = Arc::new(Mutex::new(VecDeque::from(models.clone())));
+        for _ in 0..OR_WORKERS.min(models.len()) {
+            let (queue, tx, ctx, base, scope) = (
+                queue.clone(),
+                self.tx.clone(),
+                ctx.clone(),
+                base.clone(),
+                scope.to_string(),
+            );
+            let t = self.settings.timeout_secs;
+            std::thread::spawn(move || loop {
+                let next = queue.lock().ok().and_then(|mut q| q.pop_front());
+                let Some(model) = next else { break };
+                let p = Provider {
+                    model: model.clone(),
+                    ..base.clone()
+                };
+                let verdict = api::probe_verdict(&p, &model, t);
+                let _ = tx.send(Msg::Verified {
+                    scope: scope.clone(),
+                    model,
+                    verdict,
+                });
+                ctx.request_repaint();
+            });
+        }
     }
 
     fn pump(&mut self) {
@@ -494,15 +562,46 @@ impl App {
                         Err(e) => self.or_note = e,
                     }
                 }
+                Msg::Verified {
+                    scope,
+                    model,
+                    verdict,
+                } => {
+                    let entry = self.settings.checked.entry(scope.clone()).or_default();
+                    let prog = self.verifying.entry(scope.clone()).or_insert((0, 0, 0, 0));
+                    prog.0 += 1;
+                    match verdict {
+                        Verdict::Works => {
+                            entry.insert(model, true);
+                            prog.2 += 1;
+                        }
+                        Verdict::Broken(_) => {
+                            entry.insert(model, false);
+                            prog.3 += 1;
+                        }
+                        Verdict::Unsure(_) => {
+                            entry.remove(&model);
+                        }
+                    }
+                    if prog.0 >= prog.1 {
+                        let (_, total, ok, bad) = *prog;
+                        self.verifying.remove(&scope);
+                        self.message = format!(
+                            "Verifica finita: {ok} funzionano, {bad} scartati, {} non verificabili ora (sovraccarichi o limite raggiunto).",
+                            total.saturating_sub(ok + bad)
+                        );
+                        self.save_settings();
+                    }
+                }
                 Msg::Models { id, pick, res } => {
                     match res {
-                        Ok((list, _)) if list.is_empty() => {
+                        Ok((list, _, _)) if list.is_empty() => {
                             self.model_note.insert(
                                 id,
                                 "Il servizio non ha dato un elenco: scrivi il nome a mano.".into(),
                             );
                         }
-                        Ok((list, best)) => {
+                        Ok((list, ranked, best)) => {
                             let mut note = format!("{} modelli attivi e gratuiti", list.len());
                             if pick {
                                 match best {
@@ -517,6 +616,7 @@ impl App {
                             }
                             }
                             self.model_note.insert(id.clone(), note);
+                            self.ranked.insert(id.clone(), ranked);
                             self.models.insert(id, list);
                         }
                         Err(e) => {
@@ -709,6 +809,30 @@ impl App {
             }
             ui.label(RichText::new(&self.or_note).color(theme::MUTED));
         });
+        ui.horizontal_wrapped(|ui| {
+            let busy = self.verifying.get("openrouter").copied();
+            let label = match busy {
+                Some((d, t, _, _)) => format!("Verifica in corso {d}/{t}…"),
+                None => "Verifica i modelli".to_string(),
+            };
+            let can = busy.is_none() && !self.or_models.is_empty() && !self.settings.openrouter_key.trim().is_empty();
+            if ui
+                .add_enabled(can, egui::Button::new(RichText::new(label).color(theme::ON_COLOR).strong()).fill(theme::BTN_YELLOW))
+                .clicked()
+            {
+                let base = or_provider("", &self.settings.openrouter_key);
+                let models: Vec<String> = self.or_models.iter().filter(|m| self.or_enabled(m)).cloned().collect();
+                self.start_verify(&ctx, "openrouter", &base, models);
+            }
+            ui.checkbox(&mut self.show_bad, "Mostra anche gli scartati");
+            let known = self.settings.checked.get("openrouter");
+            let ok = known.map_or(0, |m| m.values().filter(|v| **v).count());
+            let bad = known.map_or(0, |m| m.values().filter(|v| !**v).count());
+            ui.label(
+                RichText::new(format!("✓ {ok} funzionano · ✗ {bad} scartati · la verifica usa una richiesta per modello"))
+                    .color(theme::MUTED),
+            );
+        });
         ui.label(
             RichText::new(
                 "Solo modelli gratuiti, una chat per ciascuno. La chiave si crea su openrouter.ai/settings/keys. I gratuiti hanno limiti di richieste: ne partono 4 alla volta; spegni quelli che non ti servono.",
@@ -752,9 +876,26 @@ impl App {
             self.save_settings();
         }
         ui.separator();
-        let shown: Vec<usize> = (0..self.or_models.len())
-            .filter(|i| self.or_models.get(*i).is_some_and(|m| self.or_enabled(m)))
+        let mut shown: Vec<usize> = (0..self.or_models.len())
+            .filter(|i| {
+                self.or_models.get(*i).is_some_and(|m| {
+                    self.or_enabled(m)
+                        && (self.show_bad || self.verdict_of("openrouter", m) != Some(false))
+                })
+            })
             .collect();
+        // In cima i modelli verificati e funzionanti, poi quelli non ancora provati, in fondo gli scartati.
+        shown.sort_by_key(|i| {
+            match self
+                .or_models
+                .get(*i)
+                .and_then(|m| self.verdict_of("openrouter", m))
+            {
+                Some(true) => 0,
+                None => 1,
+                Some(false) => 2,
+            }
+        });
         if shown.is_empty() {
             ui.label(
                 "Nessun modello da mostrare: premi «Aggiorna elenco» o attiva qualche modello.",
@@ -781,7 +922,14 @@ impl App {
                             egui::vec2(OR_COLUMN_WIDTH, h - 14.0),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                if let (Some(t), _) = column_ui(ui, m, "", color, panel, m, None) {
+                                let title = match self.verdict_of("openrouter", m) {
+                                    Some(true) => format!("✓ {m}"),
+                                    Some(false) => format!("✗ {m}"),
+                                    None => m.clone(),
+                                };
+                                if let (Some(t), _) =
+                                    column_ui(ui, &title, "", color, panel, m, None)
+                                {
                                     copy = Some(t);
                                 }
                             },
@@ -799,6 +947,7 @@ impl App {
         let mut open = true;
         let mut delete: Option<usize> = None;
         let mut fetch: Option<(Provider, bool)> = None;
+        let mut verify: Option<Provider> = None;
         let mut add: Option<Provider> = None;
         egui::Window::new("Impostazioni").open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.label(RichText::new("Le chiavi restano solo su questo PC, nel file delle impostazioni di MultiIA.").color(theme::MUTED));
@@ -822,9 +971,15 @@ impl App {
                                     p.auto_model = false;
                                 }
                                 if let Some(list) = self.models.get(&p.id) {
+                                    let known = self.settings.checked.get(&p.id);
+                                    let st = |m: &String| known.and_then(|k| k.get(m)).copied();
+                                    // Verificati in cima, poi quelli non provati; gli scartati non si possono scegliere.
+                                    let mut sel: Vec<&String> = list.iter().filter(|m| st(m) != Some(false)).collect();
+                                    sel.sort_by_key(|m| u8::from(st(m) != Some(true)));
                                     egui::ComboBox::from_id_salt(("m", &p.id)).selected_text("scegli").show_ui(ui, |ui| {
-                                        for m in list {
-                                            if ui.selectable_value(&mut p.model, m.clone(), m).clicked() {
+                                        for m in sel {
+                                            let label = if st(m) == Some(true) { format!("✓ {m}") } else { m.clone() };
+                                            if ui.selectable_value(&mut p.model, m.clone(), label).clicked() {
                                                 p.auto_model = false;
                                             }
                                         }
@@ -835,6 +990,14 @@ impl App {
                                 }
                                 if ui.small_button("Scegli il migliore").clicked() {
                                     fetch = Some((p.clone(), true));
+                                }
+                                let busy = self.verifying.contains_key(&p.id);
+                                let can = !busy && self.models.contains_key(&p.id);
+                                if ui
+                                    .add_enabled(can, egui::Button::new(if busy { "Verifica…" } else { "Verifica modelli" }).small())
+                                    .clicked()
+                                {
+                                    verify = Some(p.clone());
                                 }
                             });
                             ui.end_row();
@@ -882,6 +1045,12 @@ impl App {
             if self.settings.providers.len() < config::MAX_PROVIDERS {
                 self.settings.providers.push(p);
             }
+        }
+        if let Some(p) = verify {
+            // I 12 più recenti: ogni prova usa una richiesta del piano gratuito.
+            let ranked = self.ranked.get(&p.id).cloned().unwrap_or_default();
+            let models: Vec<String> = ranked.into_iter().take(12).collect();
+            self.start_verify(ctx, &p.id.clone(), &p, models);
         }
         if let Some((p, pick)) = fetch {
             self.fetch_models(ctx, &p, pick);
