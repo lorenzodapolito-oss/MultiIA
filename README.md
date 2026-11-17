@@ -7,6 +7,7 @@ Una domanda, più IA insieme: ogni IA risponde in una colonna, in streaming, e p
 - Risposte in tempo reale, con tempo impiegato, token usati e «ragionamento» dei modelli che lo mostrano.
 - Conversazione continua: ogni IA ricorda i messaggi precedenti. «Nuova chat» riparte da zero.
 - **Annulla** ferma tutte le IA tenendo ciò che è già arrivato; un errore su una IA non blocca le altre.
+- Il **modello più recente che funziona** si sceglie da solo all'avvio (si può spegnere per ogni IA): MultiIA prova i più recenti con una richiesta minuscola e prende il primo che risponde; «Scegli il migliore» lo fa a richiesta. La **chiave API** si scrive anche direttamente nella colonna di ogni IA.
 - «Cerca modelli» legge l'elenco dei modelli dal servizio; «Esporta risposte» salva tutto in Markdown.
 - Colori solo pastello, mai bianco né grigio.
 

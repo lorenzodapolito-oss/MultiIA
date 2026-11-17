@@ -422,6 +422,125 @@ pub fn parse_models(body: &str) -> Vec<String> {
     collect_models(body, false)
 }
 
+const FAST: [&str; 5] = ["flash", "small", "mini", "instant", "versatile"];
+
+/// Prime due cifre del nome («gemini-3.8-flash» → [3, 8]): il numero di versione.
+fn version_key(id: &str) -> Vec<u64> {
+    id.split(|c: char| !c.is_ascii_digit())
+        .filter(|g| !g.is_empty())
+        .filter_map(|g| g.parse::<u64>().ok())
+        .take(2)
+        .collect()
+}
+
+/// Modelli attivi e gratuiti dal più recente al meno recente. Conta, nell'ordine: la stessa
+/// famiglia del modello attuale (`family`, per esempio «gemini»), la data di uscita (`created`)
+/// se il servizio la dà, il numero di versione, le versioni veloci (flash, small, mini...) che
+/// reggono meglio il piano gratuito, poi le versioni stabili prima di preview ed esperimenti.
+pub fn newest_first(body: &str, explicit_free: bool, family: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let fam = family.trim().to_lowercase();
+    let fam = fam
+        .split(['-', '/', ':', '.'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let mut items: Vec<(String, i64)> = v
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|m| is_active_and_free(m, explicit_free))
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(Value::as_str)?;
+                    let id = id.strip_prefix("models/").unwrap_or(id).to_string();
+                    Some((id, m.get("created").and_then(Value::as_i64).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let score = |id: &str| {
+        let l = id.to_lowercase();
+        (
+            !fam.is_empty() && l.starts_with(&fam),
+            l.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| FAST.contains(&t)),
+            !(l.contains("preview") || l.contains("exp")),
+        )
+    };
+    items.sort_by(|(a, ca), (b, cb)| {
+        let (sa, sb) = (score(a), score(b));
+        sb.0.cmp(&sa.0)
+            .then(cb.cmp(ca))
+            .then(version_key(b).cmp(&version_key(a)))
+            .then(sb.1.cmp(&sa.1))
+            .then(sb.2.cmp(&sa.2))
+            .then(a.len().cmp(&b.len()))
+            .then(a.cmp(b))
+    });
+    items.dedup_by(|a, b| a.0 == b.0);
+    items.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Elenco per il menu e, separato, lo stesso elenco dal più recente (`GET /models`).
+pub fn list_models_ranked(
+    p: &Provider,
+    timeout: u64,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut req = agent(timeout.min(30)).get(&models_url(&p.base_url));
+    if !p.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
+    }
+    match req.call() {
+        Ok(r) => {
+            let body = r.into_string().map_err(|e| e.to_string())?;
+            let or = p.base_url.contains("openrouter.ai");
+            let list = if or {
+                parse_free_models(&body)
+            } else {
+                parse_models(&body)
+            };
+            Ok((list, newest_first(&body, or, &p.model)))
+        }
+        Err(ureq::Error::Status(c, r)) => Err(http_error(c, &r.into_string().unwrap_or_default())),
+        Err(e) => Err(transport_error(&e)),
+    }
+}
+
+/// Prova il modello con una richiesta minuscola. Un 429 (limite al minuto) conta come
+/// «funziona»: il modello c'è, è solo il momento sbagliato.
+pub fn probe_model(p: &Provider, model: &str, timeout: u64) -> Result<(), String> {
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ciao"}],
+        "max_tokens": 8,
+    })
+    .to_string();
+    let mut req = agent(timeout.min(30))
+        .post(&chat_url(&p.base_url))
+        .set("Content-Type", "application/json");
+    if !p.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", p.api_key.trim()));
+    }
+    match req.send_string(&body) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(429, _)) => Ok(()),
+        Err(ureq::Error::Status(c, r)) => Err(http_error(c, &r.into_string().unwrap_or_default())),
+        Err(e) => Err(transport_error(&e)),
+    }
+}
+
+/// Il primo modello che risponde davvero tra i più recenti (se ne provano al massimo 4).
+pub fn pick_working(p: &Provider, ranked: &[String], timeout: u64) -> Option<String> {
+    ranked
+        .iter()
+        .take(4)
+        .find(|m| probe_model(p, m, timeout).is_ok())
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +667,32 @@ mod tests {
         assert_eq!(parse_models(b), vec!["gratis", "mistral-new", "ok"]);
         // Su OpenRouter la gratuità deve essere dichiarata: senza prezzi non vale.
         assert_eq!(parse_free_models(b), vec!["gratis"]);
+    }
+
+    #[test]
+    fn newest_models_come_first() {
+        // Con la data di uscita vince la più recente.
+        let b = r#"{"data":[{"id":"vecchio","created":100},{"id":"nuovo","created":900},{"id":"medio","created":500}]}"#;
+        assert_eq!(
+            newest_first(b, false, ""),
+            vec!["nuovo", "medio", "vecchio"]
+        );
+        // Senza data conta la versione; a pari versione la veloce e stabile prima.
+        let g = r#"{"data":[{"id":"models/gemini-2.5-flash"},{"id":"models/gemini-3.8-pro"},{"id":"models/gemini-3.8-flash"},{"id":"models/gemini-3.8-flash-preview"},{"id":"models/gemma-9-it"}]}"#;
+        let r = newest_first(g, false, "gemini-2.5-flash");
+        assert_eq!(r[0], "gemini-3.8-flash");
+        assert!(
+            r.iter().position(|m| m == "gemini-3.8-flash")
+                < r.iter().position(|m| m == "gemini-3.8-pro")
+        );
+        assert!(
+            r.iter().position(|m| m == "gemini-3.8-flash")
+                < r.iter().position(|m| m == "gemini-3.8-flash-preview")
+        );
+        // La famiglia del modello attuale ha la precedenza.
+        assert_eq!(r.last().map(String::as_str), Some("gemma-9-it"));
+        assert!(newest_first("rotto", false, "x").is_empty());
+        assert_eq!(version_key("gemini-3.8-flash"), vec![3, 8]);
     }
 
     #[test]

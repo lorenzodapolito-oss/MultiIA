@@ -35,7 +35,8 @@ enum Msg {
     },
     Models {
         id: String,
-        res: Result<Vec<String>, String>,
+        pick: bool,
+        res: Result<(Vec<String>, Option<String>), String>,
     },
     FreeModels(Result<Vec<String>, String>),
 }
@@ -84,6 +85,7 @@ pub fn or_provider(model: &str, key: &str) -> Provider {
         model: model.to_string(),
         api_key: key.to_string(),
         enabled: true,
+        auto_model: false,
     }
 }
 
@@ -95,8 +97,10 @@ fn column_ui(
     color: Color32,
     panel: &Panel,
     id: &str,
-) -> Option<String> {
+    key: Option<&mut String>,
+) -> (Option<String>, bool) {
     let mut copy = None;
+    let mut key_changed = false;
     egui::Frame::new()
         .fill(color)
         .corner_radius(10)
@@ -123,8 +127,28 @@ fn column_ui(
             if let Some((a, b)) = panel.usage {
                 st.push_str(&format!(" · {a}+{b} token"));
             }
+            if let Some(n) = &panel.note {
+                st.push_str(&format!(" · {n}"));
+            }
             ui.label(RichText::new(st).color(theme::ON_COLOR));
         });
+    // Casella per scrivere la chiave API direttamente qui; aperta da sola se manca.
+    if let Some(k) = key {
+        egui::CollapsingHeader::new("Chiave API")
+            .id_salt(("key", id))
+            .default_open(k.trim().is_empty())
+            .show(ui, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(k)
+                        .password(true)
+                        .hint_text("Incolla qui la chiave API")
+                        .desired_width(f32::INFINITY),
+                );
+                if r.changed() {
+                    key_changed = true;
+                }
+            });
+    }
     if let Some(t) = panel.history.iter().rev().find(|m| m.role == "assistant") {
         if ui.small_button("Copia ultima risposta").clicked() {
             copy = Some(t.content.clone());
@@ -158,7 +182,7 @@ fn column_ui(
                 ui.colored_label(theme::ERR, e);
             }
         });
-    copy
+    (copy, key_changed)
 }
 
 impl App {
@@ -185,6 +209,7 @@ impl App {
             model_note: HashMap::new(),
         };
         app.sync_panels();
+        app.auto_pick_models(&cc.egui_ctx);
         if app
             .settings
             .providers
@@ -210,6 +235,21 @@ impl App {
                     .unwrap_or_else(|| Panel::new(&p.id))
             })
             .collect();
+    }
+
+    /// All'avvio, per le IA con la chiave e la spunta «modello automatico», sceglie in
+    /// sottofondo il modello più recente che risponde.
+    fn auto_pick_models(&mut self, ctx: &egui::Context) {
+        let todo: Vec<Provider> = self
+            .settings
+            .providers
+            .iter()
+            .filter(|p| p.enabled && p.auto_model && (!p.needs_key() || !p.api_key.is_empty()))
+            .cloned()
+            .collect();
+        for p in todo {
+            self.fetch_models(ctx, &p, true);
+        }
     }
 
     fn sync_or_panels(&mut self) {
@@ -392,9 +432,17 @@ impl App {
         });
     }
 
-    fn fetch_models(&mut self, ctx: &egui::Context, p: &Provider) {
-        self.model_note
-            .insert(p.id.clone(), "Cerco i modelli…".into());
+    /// Cerca i modelli; con `pick` prova i più recenti e sceglie il primo che risponde.
+    fn fetch_models(&mut self, ctx: &egui::Context, p: &Provider, pick: bool) {
+        self.model_note.insert(
+            p.id.clone(),
+            if pick {
+                "Cerco il modello più recente che funziona…"
+            } else {
+                "Cerco i modelli…"
+            }
+            .into(),
+        );
         let (tx, ctx, p, t) = (
             self.tx.clone(),
             ctx.clone(),
@@ -402,8 +450,19 @@ impl App {
             self.settings.timeout_secs,
         );
         std::thread::spawn(move || {
-            let res = api::list_models(&p, t);
-            let _ = tx.send(Msg::Models { id: p.id, res });
+            let res = api::list_models_ranked(&p, t).map(|(list, ranked)| {
+                let best = if pick {
+                    api::pick_working(&p, &ranked, t)
+                } else {
+                    None
+                };
+                (list, best)
+            });
+            let _ = tx.send(Msg::Models {
+                id: p.id,
+                pick,
+                res,
+            });
             ctx.request_repaint();
         });
     }
@@ -435,22 +494,36 @@ impl App {
                         Err(e) => self.or_note = e,
                     }
                 }
-                Msg::Models { id, res } => match res {
-                    Ok(list) if list.is_empty() => {
-                        self.model_note.insert(
-                            id,
-                            "Il servizio non ha dato un elenco: scrivi il nome a mano.".into(),
-                        );
+                Msg::Models { id, pick, res } => {
+                    match res {
+                        Ok((list, _)) if list.is_empty() => {
+                            self.model_note.insert(
+                                id,
+                                "Il servizio non ha dato un elenco: scrivi il nome a mano.".into(),
+                            );
+                        }
+                        Ok((list, best)) => {
+                            let mut note = format!("{} modelli attivi e gratuiti", list.len());
+                            if pick {
+                                match best {
+                                Some(b) => {
+                                    if let Some(p) = self.settings.providers.iter_mut().find(|p| p.id == id) {
+                                        p.model = b.clone();
+                                    }
+                                    note = format!("Scelto il più recente che funziona: {b}");
+                                    self.save_settings();
+                                }
+                                None => note.push_str(" · nessuno dei più recenti ha risposto: scegline uno a mano"),
+                            }
+                            }
+                            self.model_note.insert(id.clone(), note);
+                            self.models.insert(id, list);
+                        }
+                        Err(e) => {
+                            self.model_note.insert(id, e);
+                        }
                     }
-                    Ok(list) => {
-                        self.model_note
-                            .insert(id.clone(), format!("{} modelli trovati", list.len()));
-                        self.models.insert(id, list);
-                    }
-                    Err(e) => {
-                        self.model_note.insert(id, e);
-                    }
-                },
+                }
             }
         }
     }
@@ -587,17 +660,31 @@ impl App {
             return;
         }
         let mut copy: Option<String> = None;
+        let mut keys: Vec<String> = items.iter().map(|(_, p, _)| p.api_key.clone()).collect();
+        let mut key_changed = false;
         ui.columns(items.len(), |cols| {
-            for (col, (i, p, panel)) in cols.iter_mut().zip(&items) {
+            for ((col, (i, p, panel)), key) in cols.iter_mut().zip(&items).zip(keys.iter_mut()) {
                 let color = COLORS
                     .get(i % COLORS.len())
                     .copied()
                     .unwrap_or(theme::BTN_BLUE);
-                if let Some(t) = column_ui(col, &p.name, &p.model, color, panel, &p.id) {
+                let key = p.needs_key().then_some(key);
+                let (c, k) = column_ui(col, &p.name, &p.model, color, panel, &p.id, key);
+                if let Some(t) = c {
                     copy = Some(t);
                 }
+                key_changed |= k;
             }
         });
+        if key_changed {
+            let idx: Vec<usize> = items.iter().map(|(i, _, _)| *i).collect();
+            for (i, k) in idx.into_iter().zip(keys) {
+                if let Some(p) = self.settings.providers.get_mut(i) {
+                    p.api_key = k;
+                }
+            }
+            self.save_settings();
+        }
         if let Some(t) = copy {
             ui.ctx().copy_text(t);
             self.message = "Risposta copiata.".into();
@@ -694,7 +781,7 @@ impl App {
                             egui::vec2(OR_COLUMN_WIDTH, h - 14.0),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                if let Some(t) = column_ui(ui, m, "", color, panel, m) {
+                                if let (Some(t), _) = column_ui(ui, m, "", color, panel, m, None) {
                                     copy = Some(t);
                                 }
                             },
@@ -711,7 +798,7 @@ impl App {
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let mut delete: Option<usize> = None;
-        let mut fetch: Option<Provider> = None;
+        let mut fetch: Option<(Provider, bool)> = None;
         let mut add: Option<Provider> = None;
         egui::Window::new("Impostazioni").open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.label(RichText::new("Le chiavi restano solo su questo PC, nel file delle impostazioni di MultiIA.").color(theme::MUTED));
@@ -731,16 +818,23 @@ impl App {
                             ui.end_row();
                             ui.label("Modello");
                             ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut p.model).desired_width(220.0));
+                                if ui.add(egui::TextEdit::singleline(&mut p.model).desired_width(220.0)).changed() {
+                                    p.auto_model = false;
+                                }
                                 if let Some(list) = self.models.get(&p.id) {
                                     egui::ComboBox::from_id_salt(("m", &p.id)).selected_text("scegli").show_ui(ui, |ui| {
                                         for m in list {
-                                            ui.selectable_value(&mut p.model, m.clone(), m);
+                                            if ui.selectable_value(&mut p.model, m.clone(), m).clicked() {
+                                                p.auto_model = false;
+                                            }
                                         }
                                     });
                                 }
                                 if ui.small_button("Cerca modelli").clicked() {
-                                    fetch = Some(p.clone());
+                                    fetch = Some((p.clone(), false));
+                                }
+                                if ui.small_button("Scegli il migliore").clicked() {
+                                    fetch = Some((p.clone(), true));
                                 }
                             });
                             ui.end_row();
@@ -748,6 +842,7 @@ impl App {
                             ui.add(egui::TextEdit::singleline(&mut p.api_key).password(true).desired_width(380.0));
                             ui.end_row();
                         });
+                        ui.checkbox(&mut p.auto_model, "All'avvio scegli da solo il modello più recente che funziona");
                         if let Some(n) = self.model_note.get(&p.id) {
                             ui.label(RichText::new(n).color(theme::MUTED));
                         }
@@ -788,8 +883,8 @@ impl App {
                 self.settings.providers.push(p);
             }
         }
-        if let Some(p) = fetch {
-            self.fetch_models(ctx, &p);
+        if let Some((p, pick)) = fetch {
+            self.fetch_models(ctx, &p, pick);
         }
         self.sync_panels();
         if !open {

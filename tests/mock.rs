@@ -1,5 +1,5 @@
 //! Prova con un finto servizio locale che risponde come le IA vere (streaming SSE ed errori).
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::while_let_loop)]
 use multiia::api::{list_models, stream_chat, Event, Message};
 use multiia::config::Provider;
 use std::io::{Read, Write};
@@ -8,13 +8,13 @@ use std::sync::atomic::AtomicBool;
 
 /// Legge tutta la richiesta (intestazioni e corpo): se il finto servizio chiudesse prima,
 /// il client riceverebbe un reset invece della risposta.
-fn read_request(s: &mut std::net::TcpStream) {
+fn read_request(s: &mut std::net::TcpStream) -> String {
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
-        let Ok(n) = s.read(&mut buf) else { return };
+        let Ok(n) = s.read(&mut buf) else { break };
         if n == 0 {
-            return;
+            break;
         }
         data.extend_from_slice(&buf[..n]);
         let text = String::from_utf8_lossy(&data).to_string();
@@ -28,10 +28,11 @@ fn read_request(s: &mut std::net::TcpStream) {
                 })
                 .unwrap_or(0);
             if data.len() >= i + 4 + len {
-                return;
+                break;
             }
         }
     }
+    String::from_utf8_lossy(&data).to_string()
 }
 
 fn serve(response: &'static str) -> String {
@@ -138,4 +139,42 @@ fn an_overloaded_service_is_retried_automatically() {
     assert_eq!(ev.first(), Some(&Event::Retry { attempt: 1, max: 2 }));
     assert!(ev.contains(&Event::Text("Cia".into())));
     assert_eq!(ev.last(), Some(&Event::Done));
+}
+
+/// Servizio che accetta più richieste: i modelli con «bad» nel nome danno 503, gli altri vanno.
+fn serve_models() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for conn in l.incoming().take(6) {
+            let Ok(mut s) = conn else { continue };
+            let req = read_request(&mut s);
+            let r = if req.contains("bad") {
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n{}"
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"choices\":[]}"
+            };
+            let _ = s.write_all(r.as_bytes());
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+#[test]
+fn the_newest_model_that_really_answers_is_picked() {
+    let p = Provider::new("t", &serve_models(), "x");
+    let ranked: Vec<String> = ["bad-3", "bad-2", "buono-1", "buono-0"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(
+        multiia::api::pick_working(&p, &ranked, 10),
+        Some("buono-1".to_string())
+    );
+}
+
+#[test]
+fn no_working_model_gives_none() {
+    let p = Provider::new("t", &serve_models(), "x");
+    let ranked: Vec<String> = ["bad-1", "bad-2"].map(String::from).to_vec();
+    assert_eq!(multiia::api::pick_working(&p, &ranked, 10), None);
 }

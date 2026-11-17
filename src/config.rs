@@ -41,6 +41,8 @@ pub struct Provider {
     pub model: String,
     pub api_key: String,
     pub enabled: bool,
+    /// All'avvio sceglie da solo il modello più recente che risponde.
+    pub auto_model: bool,
 }
 
 impl Default for Provider {
@@ -52,6 +54,7 @@ impl Default for Provider {
             model: String::new(),
             api_key: String::new(),
             enabled: true,
+            auto_model: true,
         }
     }
 }
