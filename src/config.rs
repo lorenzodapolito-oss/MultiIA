@@ -12,7 +12,7 @@ fn zero() -> u32 {
 }
 
 /// Servizi a pagamento tolti dall'elenco dalla versione 2.
-const PAID_HOSTS: [&str; 7] = [
+const PAID_HOSTS: [&str; 8] = [
     "api.openai.com",
     "api.anthropic.com",
     "api.deepseek.com",
@@ -20,6 +20,7 @@ const PAID_HOSTS: [&str; 7] = [
     "api.z.ai",
     "openrouter.ai",
     "api.cerebras.ai",
+    "api.mistral.ai",
 ];
 
 fn host(url: &str) -> String {
@@ -157,11 +158,6 @@ pub fn free_providers() -> Vec<Provider> {
             "llama-3.3-70b-versatile",
         ),
         Provider::new(
-            "Mistral",
-            "https://api.mistral.ai/v1",
-            "mistral-small-latest",
-        ),
-        Provider::new(
             "NVIDIA",
             "https://integrate.api.nvidia.com/v1",
             "meta/llama-3.3-70b-instruct",
@@ -263,13 +259,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_have_five_distinct_providers() {
+    fn defaults_have_four_distinct_providers() {
         let s = Settings::default();
-        assert_eq!(s.providers.len(), 5);
+        assert_eq!(s.providers.len(), 4);
         let mut ids: Vec<_> = s.providers.iter().map(|p| p.id.clone()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 5);
+        assert_eq!(ids.len(), 4);
         assert!(s
             .providers
             .iter()
@@ -331,8 +327,8 @@ mod tests {
         save(&f, &s).unwrap();
         assert_eq!(load(&f).providers[0].api_key, "segreta");
         std::fs::write(&f, "{rotto").unwrap();
-        assert_eq!(load(&f).providers.len(), 5);
-        assert_eq!(load(&d.join("manca.json")).providers.len(), 5);
+        assert_eq!(load(&f).providers.len(), 4);
+        assert_eq!(load(&d.join("manca.json")).providers.len(), 4);
         let _ = std::fs::remove_dir_all(&d);
     }
 
